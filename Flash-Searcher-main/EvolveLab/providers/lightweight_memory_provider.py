@@ -116,6 +116,11 @@ class LightweightMemoryProvider(BaseMemoryProvider):
         self.enable_longterm_provision = bool(self.config.get("enable_longterm_provision", False))
         self.longterm_min_confidence = float(self.config.get("longterm_min_confidence", 0.55))
         self.longterm_candidate_limit = int(self.config.get("longterm_candidate_limit", 12))
+        self.enable_llm_similarity_rerank = bool(self.config.get("enable_llm_similarity_rerank", True))
+        self.llm_similarity_candidate_limit = int(self.config.get("llm_similarity_candidate_limit", 12))
+        self.llm_similarity_lock_threshold = float(self.config.get("llm_similarity_lock_threshold", 0.85))
+        self.llm_failure_similarity_lock_threshold = float(self.config.get("llm_failure_similarity_lock_threshold", 0.75))
+        self.llm_similarity_min_threshold = float(self.config.get("llm_similarity_min_threshold", 0.55))
         self.begin_memory_budget_chars = int(self.config.get("begin_memory_budget_chars", 700))
         self.in_memory_budget_chars = int(self.config.get("in_memory_budget_chars", 500))
         self.max_failure_patterns = int(self.config.get("max_failure_patterns", 30))
@@ -485,13 +490,15 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                 reverse=True,
             )[: self.longterm_candidate_limit]
 
+            selection_candidates = self._apply_llm_similarity_rerank(request, candidates)
+
             # Use LLM to select and synthesize
-            guidance, selected_memory_ids = self._select_and_synthesize_longterm(request, candidates)
+            guidance, selected_memory_ids = self._select_and_synthesize_longterm(request, selection_candidates)
             
             if not guidance or not guidance.strip():
                 return None
             
-            selected_candidates = [candidate for candidate in candidates if candidate["id"] in selected_memory_ids]
+            selected_candidates = [candidate for candidate in selection_candidates if candidate["id"] in selected_memory_ids]
             selected_confidences = [candidate.get("confidence", 0.45) for candidate in selected_candidates]
             synthesized_confidence = min(selected_confidences) if selected_confidences else 0.45
             synthesized_provenance = {
@@ -520,12 +527,19 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                             "confidence": candidate.get("confidence"),
                             "applies_when": candidate.get("applies_when"),
                             "do_not_apply_when": candidate.get("do_not_apply_when"),
+                            "llm_similarity": candidate.get("llm_similarity"),
+                            "llm_applies": candidate.get("llm_applies"),
+                            "llm_risk": candidate.get("llm_risk"),
+                            "llm_locked": candidate.get("llm_locked"),
+                            "llm_reason": candidate.get("llm_reason"),
                         }
                         for candidate in selected_candidates
                     ],
                     "gating": {
                         "min_confidence": self.longterm_min_confidence,
                         "candidate_count": len(candidates),
+                        "selector_candidate_count": len(selection_candidates),
+                        "llm_similarity_rerank": self.enable_llm_similarity_rerank,
                     },
                 },
                 type=MemoryItemType.TEXT,
@@ -536,6 +550,217 @@ class LightweightMemoryProvider(BaseMemoryProvider):
         except Exception as e:
             self.logger.error(f"Long-term memory retrieval error: {str(e)}", exc_info=True)
             return None
+
+    def _apply_llm_similarity_rerank(
+        self,
+        request: MemoryRequest,
+        candidates: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Use one LLM call to rerank/filter rule-ranked long-term candidates."""
+        if not self.enable_llm_similarity_rerank or not candidates:
+            return candidates
+        if not self.model:
+            return candidates
+
+        limit = max(1, min(self.llm_similarity_candidate_limit, len(candidates)))
+        judged_candidates = candidates[:limit]
+        judgments = self._judge_longterm_similarity(request.query, judged_candidates)
+        if not judgments:
+            self.logger.info("LLM similarity judge unavailable; falling back to rule-ranked candidates")
+            return candidates
+
+        locked_candidates = []
+        medium_candidates = []
+
+        for idx, candidate in enumerate(judged_candidates, 1):
+            judgment = judgments.get(candidate["id"]) or judgments.get(str(idx))
+            if not judgment:
+                continue
+
+            similarity = judgment["similarity"]
+            applies = judgment["applies"]
+            candidate["llm_similarity"] = similarity
+            candidate["llm_applies"] = applies
+            candidate["llm_risk"] = judgment.get("risk", "unknown")
+            candidate["llm_reason"] = judgment.get("reason", "")
+
+            if not applies or similarity < self.llm_similarity_min_threshold:
+                candidate["llm_locked"] = False
+                continue
+
+            lock_threshold = (
+                self.llm_failure_similarity_lock_threshold
+                if candidate.get("type") == "failure_pattern"
+                else self.llm_similarity_lock_threshold
+            )
+            candidate["llm_locked"] = similarity >= lock_threshold
+
+            if candidate["llm_locked"]:
+                locked_candidates.append(candidate)
+            else:
+                medium_candidates.append(candidate)
+
+        def sort_key(candidate: Dict[str, Any]) -> tuple[float, float]:
+            return (
+                candidate.get("llm_similarity", 0.0),
+                candidate.get("priority_score", 0.0),
+            )
+
+        if locked_candidates:
+            selected = sorted(locked_candidates, key=sort_key, reverse=True)
+            self.logger.info(
+                "LLM similarity locked %s/%s candidates",
+                len(selected),
+                len(judged_candidates),
+            )
+            return selected
+
+        if medium_candidates:
+            selected = sorted(medium_candidates, key=sort_key, reverse=True)
+            self.logger.info(
+                "LLM similarity kept %s medium candidates",
+                len(selected),
+            )
+            return selected
+
+        self.logger.info("No candidates passed LLM similarity threshold; falling back to rule-ranked candidates")
+        return candidates
+
+    def _judge_longterm_similarity(
+        self,
+        query: str,
+        candidates: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Batch-judge current-task applicability for rule-ranked memory candidates."""
+        if not candidates:
+            return {}
+
+        candidate_lines = []
+        for idx, candidate in enumerate(candidates, 1):
+            candidate_lines.append(
+                f"{idx}. id={candidate['id']} type={candidate['type']} "
+                f"rule_relevance={candidate.get('task_relevance', 0.0):.2f} "
+                f"priority={candidate.get('priority_score', 0.0):.2f}\n"
+                f"   content: {self._compact_text(candidate.get('content', ''), 500)}\n"
+                f"   applies_when: {candidate.get('applies_when') or 'not specified'}\n"
+                f"   do_not_apply_when: {candidate.get('do_not_apply_when') or 'not specified'}"
+            )
+
+        prompt = f"""You are judging whether stored memories apply to the current task.
+
+Task query:
+{query}
+
+Candidate memories:
+{chr(10).join(candidate_lines)}
+
+Score each candidate for semantic similarity and applicability to the task.
+
+Guidelines:
+- similarity must be a number from 0.0 to 1.0.
+- applies must be true only when the memory's applies_when boundary matches and do_not_apply_when does not conflict.
+- Failure-pattern memories should be judged by matching failure mode, not by exact entities only.
+- risk is low, medium, or high. Use high when the memory could mislead this task.
+- Keep reasons short.
+
+Return JSON only:
+{{
+  "judgments": [
+    {{
+      "index": 1,
+      "memory_id": "strategic_0",
+      "similarity": 0.82,
+      "applies": true,
+      "risk": "low",
+      "reason": "same calculation pattern and constraints"
+    }}
+  ]
+}}"""
+
+        response = self._call_llm(prompt)
+        return self._parse_llm_similarity_judgments(response, candidates)
+
+    def _parse_llm_similarity_judgments(
+        self,
+        response: str,
+        candidates: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """Parse and normalize LLM similarity judgments; invalid rows are ignored."""
+        parsed = self._parse_json_response(response)
+        if not parsed:
+            return {}
+
+        if isinstance(parsed, dict):
+            rows = parsed.get("judgments") or parsed.get("scores") or parsed.get("items")
+        elif isinstance(parsed, list):
+            rows = parsed
+        else:
+            rows = None
+
+        if not isinstance(rows, list):
+            return {}
+
+        valid_ids = {candidate["id"] for candidate in candidates}
+        judgments: Dict[str, Dict[str, Any]] = {}
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+
+            memory_id = str(row.get("memory_id") or row.get("id") or "").strip()
+            index = row.get("index")
+            if not memory_id and index is not None:
+                try:
+                    idx = int(index)
+                except (TypeError, ValueError):
+                    idx = -1
+                if 1 <= idx <= len(candidates):
+                    memory_id = candidates[idx - 1]["id"]
+
+            if memory_id not in valid_ids:
+                continue
+
+            similarity = self._coerce_similarity(row.get("similarity", row.get("score")))
+            applies = self._coerce_bool(row.get("applies", row.get("applicable")))
+            if similarity is None or applies is None:
+                continue
+
+            risk = str(row.get("risk", "unknown")).strip().lower()
+            if risk not in {"low", "medium", "high", "unknown"}:
+                risk = "unknown"
+
+            judgments[memory_id] = {
+                "similarity": similarity,
+                "applies": applies,
+                "risk": risk,
+                "reason": self._compact_text(str(row.get("reason", "")), 220),
+            }
+
+        return judgments
+
+    def _coerce_similarity(self, value: Any) -> Optional[float]:
+        if isinstance(value, bool):
+            return None
+        try:
+            score = float(value)
+        except (TypeError, ValueError):
+            return None
+        if score < 0.0 or score > 1.0:
+            return None
+        return score
+
+    def _coerce_bool(self, value: Any) -> Optional[bool]:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"true", "yes", "y", "1"}:
+                return True
+            if lowered in {"false", "no", "n", "0"}:
+                return False
+        if isinstance(value, (int, float)) and value in {0, 1}:
+            return bool(value)
+        return None
 
     def _select_and_synthesize_longterm(
         self, 
@@ -553,14 +778,20 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                 provenance = c.get("provenance") or {}
                 source_type = provenance.get("source_type", "unknown")
                 evidence_span = provenance.get("evidence_span", "")
+                llm_similarity = c.get("llm_similarity")
+                llm_similarity_text = "n/a" if llm_similarity is None else f"{llm_similarity:.2f}"
                 candidate_lines.append(
                     f"{i}. [{c['type'].upper()}] "
                     f"(Success: {c['success_rate']:.1%}, Harmful: {c['harmful_rate']:.1%}, "
                     f"Confidence: {c['confidence']:.2f}, Relevance: {c.get('task_relevance', 0.0):.2f}, "
-                    f"Priority: {c.get('priority_score', 0.0):.2f}, Source: {source_type})\n"
+                    f"Priority: {c.get('priority_score', 0.0):.2f}, "
+                    f"LLM Similarity: {llm_similarity_text}, Applies: {c.get('llm_applies', 'unknown')}, "
+                    f"Risk: {c.get('llm_risk', 'unknown')}, Locked: {c.get('llm_locked', False)}, "
+                    f"Source: {source_type})\n"
                     f"   Content: {c['content']}\n"
                     f"   Applies when: {c.get('applies_when') or 'not specified'}\n"
                     f"   Do not apply when: {c.get('do_not_apply_when') or 'not specified'}\n"
+                    f"   LLM reason: {c.get('llm_reason') or 'not provided'}\n"
                     f"   Evidence: {evidence_span or 'not provided'}"
                 )
             
@@ -586,6 +817,7 @@ class LightweightMemoryProvider(BaseMemoryProvider):
 - Preserve applicability boundaries. If a memory has a "do_not_apply_when" condition that may fit, mention the caveat or skip it.
 - Prefer memories with clear provenance, higher confidence, and lower harmful rate.
 - Do not turn a task-specific fact into a general rule unless its provenance and applies_when justify it.
+- If a locked failure-pattern memory is present, include it as a compact caution unless its do_not_apply_when clearly conflicts with the task.
 **Output Format (JSON):**
 {{
   "selected_indices": [1],

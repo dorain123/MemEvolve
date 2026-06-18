@@ -269,3 +269,77 @@ The next modification should therefore not be another global priority tweak. It 
 - record a missed-memory-opportunity metric whenever relevant memories exist but held-out BEGIN receives zero long-term memories;
 - tighten extraction so failure and procedural memories include reusable `applies_when` / `do_not_apply_when` boundaries rather than conditional-answer shortcuts;
 - for geospatial tasks, add deterministic coordinate/circumcenter calculation support in the harness so memory can guide the method while code handles arithmetic.
+
+## LLM Similarity Threshold Retrieval Pass
+
+This pass implements the next retrieval-recall fix after the task-relevance isolation pass. The deterministic relevance score is kept as the first-stage filter and fallback, but a new batched LLM applicability judge now runs on the rule-ranked top candidates before the final memory selector.
+
+Mechanism:
+
+- Flow changed from `quality gate -> rule rank -> top 12 -> LLM selector` to `quality gate -> rule rank -> top 12 -> LLM similarity/applicability judge -> threshold lock/filter -> LLM selector`.
+- The judge uses one `_call_llm()` request per retrieval, not one request per memory.
+- Each judged candidate receives `llm_similarity`, `llm_applies`, `llm_risk`, `llm_reason`, and `llm_locked`.
+- General memories lock when `llm_similarity >= 0.85` and `applies=true`.
+- Failure-pattern memories lock when `llm_similarity >= 0.75` and `applies=true`.
+- Candidates with `llm_similarity < 0.55` or `applies=false` are filtered out before the final selector.
+- If at least one candidate is locked, only locked candidates are passed to `_select_and_synthesize_longterm()`. This is the "stop expanding similar memories once a threshold match is found" behavior.
+- If no candidate locks but some are medium relevant, only those medium candidates are passed forward.
+- If the judge fails or no candidates pass, retrieval falls back to the existing rule-ranked candidates so a JSON failure cannot zero out memory provision.
+- The selector prompt now shows `LLM Similarity`, `Applies`, `Risk`, `Locked`, and `LLM reason`. It also says locked failure-pattern memories should be included as compact cautions unless `do_not_apply_when` clearly conflicts.
+
+Configuration added:
+
+- `enable_llm_similarity_rerank: True`
+- `llm_similarity_candidate_limit: 12`
+- `llm_similarity_lock_threshold: 0.85`
+- `llm_failure_similarity_lock_threshold: 0.75`
+- `llm_similarity_min_threshold: 0.55`
+
+Validation:
+
+- `python -m compileall EvolveLab\providers\lightweight_memory_provider.py`: passed.
+- `git diff --check -- Flash-Searcher-main/EvolveLab/providers/lightweight_memory_provider.py Flash-Searcher-main/EvolveLab/config.py`: passed with only the existing CRLF warning.
+- A smoke check covered JSON code fences, missing fields, invalid scores, empty responses, fallback behavior, and the failure-pattern `0.75` lock threshold.
+
+Runs:
+
+- `xbench_output/targeted_warmstart_llm_similarity_dialogue_20260618_192931`
+- `xbench_output/targeted_warmstart_llm_similarity_shuttle_20260618_193600`
+- `xbench_output/targeted_warmstart_llm_similarity_geo_20260618_194630`
+
+Summary:
+
+| Suite | Original failed task | Train tasks | Held-out correct | Total tokens | API calls | Elapsed | Change vs task-relevance pass |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `classical_dialogue_task3` | 3 | 2 | 1/1 | 108,141 | 23 | 315.8s | Better: held-out changed from wrong `5` with 0 events to correct `4` with 1 long-term event |
+| `shuttlecock_task5` | 5 | 3 | 1/1 | 231,439 | 39 | 570.5s | Mixed: still correct and feedback improved, but cost rose sharply |
+| `geospatial_task10` | 10 | 2 | 0/1 | 513,252 | 47 | 498.2s | Partly better: BEGIN long-term recall fixed, but final answer still wrong |
+
+Held-out details:
+
+| Suite | Held-out score | Held-out answer | Held-out tokens | API calls | Memory events | Feedback |
+|---|---:|---|---:|---:|---:|---|
+| `classical_dialogue_task3` | 1 | `4` | 86,602 | 15 | 1 | neutral 1 |
+| `shuttlecock_task5` | 1 | `12` | 182,009 | 24 | 2 | helpful 1, neutral 1 |
+| `geospatial_task10` | 0 | `约2.2公里（2.0～2.5公里）` | 338,577 | 25 | 2 | neutral 2 |
+
+LLM lock observations:
+
+- Task 3: training locked `1/4` candidates; held-out locked `3/6` candidates. This fixed the previous "no memory event" failure and the held-out answer returned to `4`.
+- Task 5: training locked `1/4` and `1/8`; held-out locked `3/10`. The final answer stayed correct at `12`, and the long-term memory was labeled helpful.
+- Task 10: training locked `1/4`; held-out locked `2/8`, so the previous BEGIN `0 long-term memories` problem was fixed. However, both training tasks happened to succeed in this rerun, so this run did not exercise the failure-pattern caution lane in held-out; it exercised locked strategic-memory recall instead.
+
+Interpretation:
+
+- The LLM similarity layer is better than deterministic relevance alone for retrieval recall. It restored a held-out long-term event on Task 3 and fixed the Task 10 BEGIN zero-injection problem.
+- It is not enough to solve Task 10 end-to-end. The held-out run used the right high-level memory ("treat as coordinate circumcenter geometry") but still failed to obtain or normalize the third site coordinate, then estimated a point and answered about `2.2 km` instead of `6～7km`.
+- Task 5 shows the cost tradeoff. The mechanism kept correctness and improved memory feedback, but the held-out cost increased from the relevance pass's 82,979 tokens / 14 API calls to 182,009 tokens / 24 API calls. Some of that is search nondeterminism, but the extra LLM judge and longer trajectory clearly do not make this cheaper.
+- The failure-pattern threshold path is implemented and smoke-tested, but the targeted Task 10 rerun did not naturally produce a failure pattern before held-out. A stricter failure-lane evaluation should seed or retain known coordinate-search failure patterns and then test whether they are injected as cautions.
+
+Updated conclusion:
+
+This is a real improvement over the pure task-relevance sorting pass, but it is a retrieval improvement, not a full benchmark win.
+
+- Better: Task 3 recovered correctness with memory injection; Task 10 recovered BEGIN long-term recall; Task 5 stayed correct with one helpful long-term memory.
+- Still weak: token/API cost can rise, and memory can only advise the agent. It cannot replace deterministic coordinate lookup, coordinate normalization, or circumcenter arithmetic.
+- Next best improvement should be in the harness: add a deterministic geospatial helper for address/coordinate normalization and circumcenter/radius calculation, then let memory only decide when to call it and what evidence boundary to check.
