@@ -730,6 +730,73 @@ class ToolCallingAgent(MultiStepAgent):
         }
         return event
 
+    def _reset_early_stop_state(self) -> None:
+        self._early_stop_reason = None
+        self._early_stop_state = {
+            "last_signature": "",
+            "duplicate_count": 0,
+            "failure_count": 0,
+            "no_progress_count": 0,
+        }
+
+    def _observation_signature(self, observations: str) -> str:
+        normalized = re.sub(r"\s+", " ", (observations or "").lower()).strip()
+        if not normalized or normalized == "no observations":
+            return ""
+        return normalized[:700]
+
+    def _observation_has_evidence(self, observations: str) -> bool:
+        if not observations:
+            return False
+        lowered = observations.lower()
+        if re.search(r"https?://", observations):
+            return True
+        if re.search(r"\d+(?:\.\d+)?", observations):
+            return True
+        evidence_words = ["source:", "date published:", "final answer", "summary:", "答案", "结果"]
+        return any(word in lowered for word in evidence_words)
+
+    def _observation_is_failure_only(self, observations: str) -> bool:
+        lowered = (observations or "").lower()
+        failure_words = ["error", "failed", "timeout", "quota", "rate limit", "exception"]
+        return any(word in lowered for word in failure_words) and not self._observation_has_evidence(observations)
+
+    def _update_early_stop_state(self, memory_step: ActionStep) -> Optional[str]:
+        if not getattr(memory_step, "observations", None):
+            return None
+        if memory_step.tool_calls and any(call.name == "final_answer" for call in memory_step.tool_calls):
+            return None
+
+        signature = self._observation_signature(memory_step.observations or "")
+        if not signature:
+            return None
+
+        state = self._early_stop_state
+        if signature == state.get("last_signature"):
+            state["duplicate_count"] += 1
+        else:
+            state["duplicate_count"] = 0
+            state["last_signature"] = signature
+
+        if self._observation_is_failure_only(memory_step.observations or ""):
+            state["failure_count"] += 1
+        else:
+            state["failure_count"] = 0
+
+        if state["duplicate_count"] > 0 or state["failure_count"] > 0 or not self._observation_has_evidence(memory_step.observations or ""):
+            state["no_progress_count"] += 1
+        else:
+            state["no_progress_count"] = 0
+
+        step_number = memory_step.step_number or self.step_number
+        if state["failure_count"] >= 3 and step_number >= 4:
+            return "three consecutive tool failures without usable evidence"
+        if state["duplicate_count"] >= 2 and step_number >= 5:
+            return "repeated identical observations"
+        if state["no_progress_count"] >= 3 and step_number >= 6:
+            return "three consecutive low-progress steps"
+        return None
+
     def _format_current_context(self) -> str:
         try:
             messages = self.write_memory_to_messages()
@@ -765,7 +832,8 @@ class ToolCallingAgent(MultiStepAgent):
         self.step_number = 0
         self.memory_events = []
         self._last_memory_events = []
-        while final_answer is None and self.step_number <= self.max_steps:
+        self._reset_early_stop_state()
+        while final_answer is None and self.step_number <= self.max_steps and not self._early_stop_reason:
             step_start_time = time.time()
             memory_step = ActionStep(
                 step_number=self.step_number,
@@ -790,12 +858,20 @@ class ToolCallingAgent(MultiStepAgent):
             finally:
                 memory_step.end_time = time.time()
                 memory_step.duration = memory_step.end_time - step_start_time
+                early_stop_reason = self._update_early_stop_state(memory_step)
+                if early_stop_reason and final_answer is None:
+                    memory_step.early_stop_reason = early_stop_reason
+                    self._early_stop_reason = early_stop_reason
                 self.memory.steps.append(memory_step)
                 self.step_number += 1
                 yield memory_step
 
-        if final_answer is None and self.step_number > self.max_steps:
-            error_message = "Reached max steps."
+        if final_answer is None and (self.step_number > self.max_steps or self._early_stop_reason):
+            error_message = (
+                f"Early stop: {self._early_stop_reason}"
+                if self._early_stop_reason
+                else "Reached max steps."
+            )
             step_start_time = time.time()
             cot_think, final_think, final_answer = self.provide_final_answer(task)
 
@@ -806,8 +882,9 @@ class ToolCallingAgent(MultiStepAgent):
             final_memory_step.action_reasoning = cot_think
             final_memory_step.action_think = final_think
             final_memory_step.action_output = final_answer
+            final_memory_step.early_stop_reason = self._early_stop_reason
             final_memory_step.end_time = time.time()
-            final_memory_step.duration = memory_step.end_time - step_start_time
+            final_memory_step.duration = final_memory_step.end_time - step_start_time
             self.memory.steps.append(final_memory_step)
 
             yield final_memory_step

@@ -74,6 +74,7 @@ class ActionStep(MemoryStep):
     evaluate_thought: str | None = None
     memory_guidance: str | None = None
     memory_events: List[Dict[str, Any]] | None = None
+    early_stop_reason: str | None = None
     
     def dict(self):
         return {
@@ -93,6 +94,7 @@ class ActionStep(MemoryStep):
             "evaluate_thought": self.evaluate_thought,
             "memory_guidance": self.memory_guidance,
             "memory_events": self.memory_events or [],
+            "early_stop_reason": self.early_stop_reason,
         }
 
     def to_messages(self, summary_mode: bool = False, show_model_input_messages: bool = False) -> List[Message]:

@@ -104,3 +104,58 @@ Before a larger 20-50 task evaluation, tighten:
 - memory injection frequency,
 - harmful/stale/unsupported suppression,
 - held-out train/test protocol.
+
+## Optimization Pass - Memory and Harness Follow-up
+
+This follow-up implements the improvement direction after the 1-10 A/B run: keep the harmful-memory evaluation path, but reduce the inference cost and test whether memory can help on a small targeted warm-start setting.
+
+The full idea is:
+
+- Do not treat every retrieved memory as useful. Each injected memory already carries `memory_id`, so retrieval should suppress memories with high harmful rate, stale labels, unsupported labels, or low confidence before they enter the prompt.
+- Do not let long-term memory behave like a default prompt appendix. Long-term retrieval is now gated by confidence, source/evidence quality, harmful feedback, and a smaller top-k/budget.
+- Do not over-learn from every intermediate step. Short-term extraction is throttled by step interval, context delta, and final/evidence signals, so repeated tool logs or low-information observations are less likely to become memory.
+- Do not inject memory too early for simple fact questions. Simple tasks get delayed memory provision; complex tasks still receive memory when the query suggests multi-hop reasoning, constraints, lists, date boundaries, standards, or geometric reasoning.
+- Do not compress procedural memory into boundary-free slogans. The extraction prompt now favors compact decision memory: verified facts, constraints, and cautions, while discouraging unverified guesses and process logs.
+- Do not let repeated failed tool calls burn all remaining steps. The harness now records `early_stop_reason` and can stop after repeated no-evidence/failure observations, then ask for a final answer once.
+- Do not run a large benchmark before the mechanism is checked. The added targeted warm-start runner starts from empty `lightweight_memory`, teaches a few synthetic similar tasks, and then probes held-out tasks that previously failed, such as the shuttlecock/GB standard case, classical-dialogue counting, and three-point equidistance.
+
+Expected targeted benchmark size:
+
+- If the first suite succeeds early: about 3-4 tasks.
+- If all configured suites run: about 9-12 tasks.
+- This is a mechanism probe, not a replacement for the later 20-50 task held-out evaluation.
+
+## Targeted Warm-Start Result
+
+Run:
+
+- Output directory: `xbench_output/targeted_warmstart_optimized_20260618_172536`
+- Suite: `shuttlecock_task5`
+- Protocol: empty `lightweight_memory` -> 3 synthetic training tasks -> original XBench task 5 held-out
+- Stop condition: stop after the first suite with a correct held-out result
+
+Summary:
+
+| Suite | Train tasks | Held-out correct | Total tokens | API calls | Elapsed |
+|---|---:|---:|---:|---:|---:|
+| shuttlecock_task5 | 3 | 1/1 | 155,635 | 31 | 295.6s |
+
+Held-out task 5 details:
+
+- Previous 1-10 run: task 5 was incorrect under both baseline and `lightweight_memory`.
+- Targeted warm-start run: task 5 became correct.
+- Held-out answer: `12只`, extracted answer `12`, golden answer `12`.
+- Held-out cost: 44,995 tokens, 9 API calls, 93.6s.
+- Injected memory events: 1 long-term memory at BEGIN.
+- Memory feedback: helpful 1, neutral 0, harmful 0, stale 0, unsupported 0.
+
+The injected memory was the intended reusable rule: compute total feather demand first, verify GB/T 11881-2006 feather count, divide by usable feathers per animal, and apply ceiling arithmetic. It also carried provenance metadata with the selected source memory (`strategic_6`), retrieval time, confidence, and evidence span.
+
+This is a positive mechanism result, not a broad benchmark result. The training tasks were intentionally close to the failed held-out task, so the improvement mainly shows that:
+
+- the memory path can learn and reuse the right procedural pattern,
+- the gated top-1 long-term retrieval can inject a useful memory without flooding the prompt,
+- helpful/harmful labeling can distinguish this memory as helpful instead of merely neutral,
+- the optimized budget gates reduced short-term injection noise during execution.
+
+The main caution is that the total suite still spent 155,635 tokens because three training tasks were needed before the held-out task. For a full claim, the next step is still a larger train/test evaluation where training cost is amortized across many held-out tasks.

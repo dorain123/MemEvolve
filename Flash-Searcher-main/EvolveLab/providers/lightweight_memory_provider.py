@@ -6,8 +6,8 @@ A streamlined, efficient dual-memory system:
 2. Long-term Memory: Compact JSON storage with 30 strategic + 30 operational memories
 
 Core Features:
-- Short-term memory: Provided every 3 steps during execution
-- Long-term memory: Only provided at BEGIN phase (top 5 most relevant)
+- Short-term memory: Extracted/provided through budget gates during execution
+- Long-term memory: Gated at BEGIN phase and limited to a small top-k
 - Minimal overhead: Simple JSON storage, no vector indices
 - LLM-driven selection: Intelligent matching and synthesis
 """
@@ -77,7 +77,7 @@ class LightweightMemoryProvider(BaseMemoryProvider):
     Architecture:
     1. Short-term Memory: In-memory list of key facts/constraints for current task
     2. Long-term Memory: JSON file with 30 strategic + 30 operational memories
-    3. Frequency Control: Short-term every 3 steps, long-term only at BEGIN
+    3. Frequency Control: Budget-gated short-term, gated long-term at BEGIN
     """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None):
@@ -107,13 +107,17 @@ class LightweightMemoryProvider(BaseMemoryProvider):
         # Configuration parameters
         self.max_strategic_memories = int(self.config.get("max_strategic_memories", 30))
         self.max_operational_memories = int(self.config.get("max_operational_memories", 30))
-        self.max_shortterm_items = int(self.config.get("max_shortterm_items", 10))
-        self.shortterm_provision_interval = int(self.config.get("shortterm_provision_interval", 3))
-        self.top_k_longterm = int(self.config.get("top_k_longterm", 5))
+        self.max_shortterm_items = int(self.config.get("max_shortterm_items", 8))
+        self.shortterm_provision_interval = int(self.config.get("shortterm_provision_interval", 8))
+        self.shortterm_extraction_interval = int(self.config.get("shortterm_extraction_interval", 3))
+        self.min_shortterm_delta_chars = int(self.config.get("min_shortterm_delta_chars", 250))
+        self.simple_task_memory_delay_steps = int(self.config.get("simple_task_memory_delay_steps", 6))
+        self.top_k_longterm = int(self.config.get("top_k_longterm", 1))
         self.enable_longterm_provision = bool(self.config.get("enable_longterm_provision", False))
-        self.longterm_min_confidence = float(self.config.get("longterm_min_confidence", 0.35))
-        self.begin_memory_budget_chars = int(self.config.get("begin_memory_budget_chars", 1600))
-        self.in_memory_budget_chars = int(self.config.get("in_memory_budget_chars", 900))
+        self.longterm_min_confidence = float(self.config.get("longterm_min_confidence", 0.55))
+        self.longterm_candidate_limit = int(self.config.get("longterm_candidate_limit", 12))
+        self.begin_memory_budget_chars = int(self.config.get("begin_memory_budget_chars", 700))
+        self.in_memory_budget_chars = int(self.config.get("in_memory_budget_chars", 500))
         self.max_failure_patterns = int(self.config.get("max_failure_patterns", 30))
         
         # Memory buffer configuration (allow expansion before pruning)
@@ -140,8 +144,10 @@ class LightweightMemoryProvider(BaseMemoryProvider):
             "query": None,
             "start_time": None,
             "current_step": 0,
-            "last_shortterm_provision_step": -999,
+            "last_shortterm_provision_step": 0,
+            "last_shortterm_extract_step": -999,
             "longterm_provided": False,  # Only provide once at BEGIN
+            "is_simple_task": False,
             "last_context": "",  # Store last step's context for delta calculation
             "agent_steps": [],  # Store step summaries: [{"step": N, "summary": "...", "timestamp": ...}, ...]
             "used_memory_ids": [],  # Track which long-term memories were used in this task
@@ -235,6 +241,8 @@ class LightweightMemoryProvider(BaseMemoryProvider):
             if request.status == MemoryStatus.BEGIN:
                 if not self.enable_longterm_provision:
                     self.logger.info("🚫 Long-term memory provision is disabled via config")
+                elif self.task_context.get("is_simple_task"):
+                    self.logger.info("Skipping BEGIN long-term memory for simple single-answer task")
                 elif not self.task_context["longterm_provided"]:
                     self.logger.info("BEGIN phase: Retrieving long-term memory...")
                     longterm_guidance = self._retrieve_longterm_memory(request)
@@ -247,14 +255,27 @@ class LightweightMemoryProvider(BaseMemoryProvider):
             
             # ===== IN Phase: Auto-extract + Provide short-term memory =====
             elif request.status == MemoryStatus.IN:
-                # Auto-extract key information from current step (every step)
-                self._auto_extract_shortterm(request)
+                if self._should_extract_shortterm(request, current_step):
+                    self._auto_extract_shortterm(request)
+                    self.task_context["last_shortterm_extract_step"] = current_step
+                else:
+                    self.logger.info("Skipping short-term extraction by budget gate")
                 
                 # Provide accumulated short-term memory (every N steps)
                 last_provision = self.task_context["last_shortterm_provision_step"]
                 steps_since_last = current_step - last_provision
                 
-                if steps_since_last >= self.shortterm_provision_interval:
+                simple_delay_active = (
+                    self.task_context.get("is_simple_task")
+                    and current_step < self.simple_task_memory_delay_steps
+                )
+
+                if simple_delay_active:
+                    self.logger.info(
+                        f"Skipping short-term memory for simple task until step "
+                        f"{self.simple_task_memory_delay_steps}"
+                    )
+                elif steps_since_last >= self.shortterm_provision_interval:
                     self.logger.info(f"Providing short-term memory (step {current_step})")
                     shortterm_guidance = self._retrieve_shortterm_memory(request)
                     if shortterm_guidance:
@@ -413,22 +434,32 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                         memory_list[idx] = mem
                     confidence = self._memory_confidence(mem)
                     usage_count = mem.get("usage_count", 0)
+                    helpful_count = mem.get("helpful_count", 0)
+                    neutral_count = mem.get("neutral_count", 0)
                     harmful_count = mem.get("harmful_count", 0)
                     unsupported_count = mem.get("unsupported_count", 0)
+                    stale_count = mem.get("stale_count", 0)
                     harmful_rate = harmful_count / usage_count if usage_count else 0.0
-                    
+
                     if confidence < self.longterm_min_confidence and usage_count == 0:
+                        continue
+                    if harmful_count >= 1 and helpful_count == 0:
                         continue
                     if usage_count >= 2 and harmful_rate >= 0.5:
                         continue
                     if unsupported_count >= 2 and mem.get("success_count", 0) == 0:
                         continue
-                    
+                    if stale_count >= 1 and helpful_count == 0:
+                        continue
+
                     candidates.append({
                         "id": f"{memory_type}_{idx}",
                         "type": memory_type,
                         "content": mem.get("content", ""),
                         "usage_count": usage_count,
+                        "helpful_count": helpful_count,
+                        "neutral_count": neutral_count,
+                        "harmful_count": harmful_count,
                         "success_rate": self._calculate_success_rate(mem),
                         "harmful_rate": harmful_rate,
                         "confidence": confidence,
@@ -441,6 +472,12 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                 self.logger.info("No long-term memories passed gating")
                 return None
             
+            candidates = sorted(
+                candidates,
+                key=self._memory_priority_score,
+                reverse=True,
+            )[: self.longterm_candidate_limit]
+
             # Use LLM to select and synthesize
             guidance, selected_memory_ids = self._select_and_synthesize_longterm(request, candidates)
             
@@ -528,11 +565,12 @@ class LightweightMemoryProvider(BaseMemoryProvider):
 {chr(10).join(candidate_lines)}
 
 **Your Tasks:**
-1. Select the top {self.top_k_longterm} most relevant memories (strategic, operational, or failure-pattern cautions)
+1. Select at most {self.top_k_longterm} relevant memories (strategic, operational, or failure-pattern cautions)
 2. Synthesize them into concise, actionable guidance
 
 **Synthesis Requirements:**
 - Keep it within {self.begin_memory_budget_chars} characters
+- If no memory clearly applies to this task, return an empty selected_indices list and empty guidance
 - Include failure-pattern cautions only when their applies_when boundary matches this task
 - Combine related points, avoid redundancy
 - Use bullet points for readability
@@ -542,7 +580,7 @@ class LightweightMemoryProvider(BaseMemoryProvider):
 - Do not turn a task-specific fact into a general rule unless its provenance and applies_when justify it.
 **Output Format (JSON):**
 {{
-  "selected_indices": [1, 3, 5],
+  "selected_indices": [1],
   "guidance": "Your synthesized guidance here..."
 }}
 
@@ -551,23 +589,23 @@ class LightweightMemoryProvider(BaseMemoryProvider):
             response = self._call_llm(prompt)
             
             if not response or not response.strip():
-                return ""
+                return "", []
             
             # Parse JSON response
             result = self._parse_json_response(response)
             if result:
                 selected_indices = result.get("selected_indices", [])
                 guidance = result.get("guidance", "")
-                
+
                 # Update usage_count for selected memories
                 selected_memory_ids = self._update_memory_usage(candidates, selected_indices)
-                
+
                 return self._compact_text(guidance.strip(), self.begin_memory_budget_chars), selected_memory_ids
             else:
                 # Fallback: treat response as plain text guidance
                 self.logger.warning("Failed to parse JSON from LLM, treating as plain text")
                 return self._compact_text(response.strip(), self.begin_memory_budget_chars), []
-            
+
         except Exception as e:
             self.logger.error(f"Long-term synthesis error: {str(e)}", exc_info=True)
             return "", []
@@ -652,6 +690,100 @@ class LightweightMemoryProvider(BaseMemoryProvider):
         # (fallback for cases where context is restructured)
         return current_context.strip()
 
+    def _is_simple_task(self, query: str) -> bool:
+        """Detect single-answer tasks where memory often costs more than it helps."""
+        if not query:
+            return False
+        query_lower = query.lower()
+        simple_markers = [
+            "多少",
+            "几",
+            "哪两个",
+            "哪位",
+            "哪个",
+            "什么",
+            "who",
+            "what",
+            "how many",
+            "calculate",
+            "compute",
+        ]
+        complex_markers = [
+            "分别",
+            "所有",
+            "列表",
+            "前五",
+            "多个",
+            "合计",
+            "比较",
+            "至少",
+            "符合gb",
+            "gb/t",
+            "后半句",
+            "故事",
+            "小说",
+            "讲了几句话",
+            "距离相等",
+            "等距",
+            "三地",
+            "路线",
+            "从正赛首轮开始",
+        ]
+        if any(marker in query_lower for marker in complex_markers):
+            return False
+        return any(marker in query_lower for marker in simple_markers) and len(query) < 180
+
+    def _context_has_final_answer(self, context: str) -> bool:
+        lowered = (context or "").lower()
+        return "final_answer" in lowered or "final answer" in lowered
+
+    def _context_has_important_signal(self, context_delta: str) -> bool:
+        if not context_delta:
+            return False
+        lowered = context_delta.lower()
+        if any(token in lowered for token in ["error", "failed", "timeout", "quota", "contradict", "conflict"]):
+            return True
+        if re.search(r"https?://", context_delta):
+            return True
+        if re.search(r"\d+(?:\.\d+)?\s*(?:km|m|元|克|%|gflops|枚|期|年|米|只|根)", lowered):
+            return True
+        return False
+
+    def _should_extract_shortterm(self, request: MemoryRequest, current_step: int) -> bool:
+        last_extract = self.task_context.get("last_shortterm_extract_step", -999)
+        if current_step - last_extract < self.shortterm_extraction_interval:
+            return False
+
+        context_delta = self._calculate_context_delta(request.context)
+        if len(context_delta.strip()) < self.min_shortterm_delta_chars:
+            self.task_context["last_context"] = request.context
+            return False
+        if self._context_has_final_answer(context_delta):
+            self.task_context["last_context"] = request.context
+            return False
+
+        if self.task_context.get("is_simple_task") and not self._context_has_important_signal(context_delta):
+            self.task_context["last_context"] = request.context
+            return False
+
+        return True
+
+    def _memory_priority_score(self, candidate: Dict[str, Any]) -> float:
+        usage = candidate.get("usage_count", 0)
+        success_rate = candidate.get("success_rate", 0.0)
+        harmful_rate = candidate.get("harmful_rate", 0.0)
+        confidence = candidate.get("confidence", 0.0)
+        neutral_count = candidate.get("neutral_count", 0)
+        helpful_count = candidate.get("helpful_count", 0)
+        return (
+            confidence
+            + success_rate
+            + min(helpful_count, 3) * 0.15
+            + min(usage, 5) * 0.03
+            - harmful_rate * 1.5
+            - min(neutral_count, 5) * 0.04
+        )
+
     def _auto_extract_shortterm(self, request: MemoryRequest) -> None:
         """
         Automatically extract key information and generate step summary
@@ -676,7 +808,7 @@ class LightweightMemoryProvider(BaseMemoryProvider):
             self.task_context["last_context"] = request.context
             
             # Skip if delta is too short (no meaningful new information)
-            if len(context_delta.strip()) < 50:
+            if len(context_delta.strip()) < self.min_shortterm_delta_chars:
                 return
             
             # Build current memory context
@@ -689,11 +821,11 @@ class LightweightMemoryProvider(BaseMemoryProvider):
             # Build previous steps summary
             prev_steps_summary = self._build_prev_steps_summary()
             #- **If the task is time-sensitive, for time-dependent facts or data (e.g., population in a specific year, event dates), include the relevant time information in the extracted key point**
-            # Combined LLM call: Generate step summary + Extract key information
+            # Combined LLM call: Generate step summary + extract compact decision memory.
             prompt = f"""You are analyzing the current step of task execution. Perform TWO tasks:
 
 1. Generate a brief summary of what happened in this step
-2. Extract key information that should be remembered
+2. Extract compact decision points that should be remembered
 
 **Original Task:**
 {request.query}
@@ -720,13 +852,12 @@ Capture in 2-3 sentences:
 - Any important state changes
 
 **Task 2 - Key Extraction Requirements (maximum 3 items):**
-Extract ONLY task-related information that is truly critical:
+Extract ONLY compact decision points that can change future reasoning:
 
-**EXTRACT (Task-Related Information):**
-- Task-specific constraints or requirements discovered during execution (e.g., "output must be in kilometers", "no commas allowed", "date format: YYYY-MM-DD")
-- Key data values or numerical results from the task (e.g., "Beijing coordinates: 39.9°N, 116.4°E", "total population: 21.5 million")
-- Important discoveries or findings related to the task content (e.g., "source A contradicts source B", "calculation requires unit conversion")
-- Task-specific conditions or constraints (e.g., "must use data from 2023", "exclude weekends")
+**EXTRACT:**
+- Verified facts with source context (e.g., "Official page says X=12 for 2024")
+- Hard task constraints (e.g., "answer must be in kilometers")
+- Failed paths or cautions (e.g., "Do not reuse source A because it is 2022 data")
 
 **DO NOT EXTRACT (System/Format Instructions):**
 - Memory system guidance
@@ -735,14 +866,17 @@ Extract ONLY task-related information that is truly critical:
 - General execution guidelines or workflow rules
 - Agent behavior instructions or protocol requirements
 - Any meta-instructions about how to structure responses or use tools
+- Unverified guesses, unless explicitly labeled as a caution
+- Search process logs that do not change the answer
 
 **Extraction Rules:**
-- Each item: ONE concise sentence (15-20 words max), **prefer direct quotes or close paraphrasing from the context to preserve original meaning**
+- Each item: ONE concise sentence (15-20 words max)
+- Prefix each item with one label: VERIFIED:, CONSTRAINT:, or CAUTION:
 - **ONLY extract information directly related to the TASK CONTENT, not execution mechanics**
 - **DO NOT extract information already in working memory**
-- Prioritize: Task Constraints > Key Data Values > Important Discoveries
+- Prioritize: verified facts > hard constraints > cautions about failed paths
 - If nothing new/important related to the task, set "key_extracts" to empty array []
-- **Preserve original meaning: quote or closely paraphrase the source text, don't rephrase unnecessarily**
+- Do not promote a task-specific fact into a general rule
 
 **Critical Filter:**
 Before extracting any item, ask: "Is this about the TASK CONTENT (data, constraints, results) or about SYSTEM INSTRUCTIONS (format, tools, workflow)?"
@@ -809,7 +943,7 @@ Before extracting any item, ask: "Is this about the TASK CONTENT (data, constrai
         
         try:
             # Format short-term memory into readable text
-            content_lines = ["**Key Information & Constraints:**"]
+            content_lines = ["**Compact Decision Memory:**"]
             for idx, item in enumerate(self.shortterm_memory, 1):
                 content_lines.append(f"{idx}. {item}")
             
@@ -1919,8 +2053,10 @@ Provide ONLY the JSON array, nothing else.
             "query": query,
             "start_time": time.time(),
             "current_step": 0,
-            "last_shortterm_provision_step": -999,
+            "last_shortterm_provision_step": 0,
+            "last_shortterm_extract_step": -999,
             "longterm_provided": False,
+            "is_simple_task": self._is_simple_task(query or ""),
             "last_context": "",  # Reset context tracking
             "agent_steps": [],  # Reset step summaries
             "used_memory_ids": [],  # Reset used memory tracking

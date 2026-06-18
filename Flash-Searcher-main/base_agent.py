@@ -63,6 +63,7 @@ class BaseAgent:
                     "cot_think": step.action_reasoning,
                     "memory_guidance": step.memory_guidance,
                     "memory_events": step.memory_events or [],
+                    "early_stop_reason": getattr(step, "early_stop_reason", None),
                 }
                 trajectory.append(traj)
             else:
