@@ -113,6 +113,56 @@ class TrajectoryFeedbackAggregator:
             return [str(v).strip() for v in val if str(v).strip()]
         return []
 
+    def _memory_events(self, task_data: Dict[str, Any]) -> List[Dict[str, Any]]:
+        events = []
+        seen = set()
+
+        def add_event(event: Any) -> None:
+            if not isinstance(event, dict):
+                return
+            key = (
+                event.get("memory_id"),
+                event.get("phase"),
+                event.get("step_number"),
+                str(event.get("content") or event.get("content_preview") or "")[:200],
+            )
+            if key in seen:
+                return
+            seen.add(key)
+            events.append(event)
+
+        for event in task_data.get("memory_events", []) or []:
+            add_event(event)
+        for step in task_data.get("agent_trajectory", []) or []:
+            for event in step.get("memory_events", []) or []:
+                add_event(event)
+        return events
+
+    def _memory_feedback_stats(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
+        events = self._memory_events(task_data)
+        labels = ["helpful", "neutral", "harmful", "stale", "unsupported"]
+        counts = {label: 0 for label in labels}
+
+        for event in events:
+            label = event.get("label")
+            if label in counts:
+                counts[label] += 1
+
+        summary = task_data.get("memory_feedback") or {}
+        total = len(events)
+        if not total and isinstance(summary, dict):
+            total = int(summary.get("total", 0) or 0)
+            for label in labels:
+                counts[label] = int(summary.get(label, 0) or 0)
+
+        return {
+            "events": total,
+            **counts,
+            "harmful_rate": counts["harmful"] / total if total else float(summary.get("harmful_rate", 0.0) or 0.0),
+            "unsupported_rate": counts["unsupported"] / total if total else float(summary.get("unsupported_rate", 0.0) or 0.0),
+            "stale_rate": counts["stale"] / total if total else float(summary.get("stale_rate", 0.0) or 0.0),
+        }
+
     def compute_feedback(self, task_data: Dict[str, Any]) -> Dict[str, Any]:
         trajectory: List[Dict[str, Any]] = task_data.get("agent_trajectory", [])
         is_correct = self._is_task_correct(task_data)
@@ -131,6 +181,7 @@ class TrajectoryFeedbackAggregator:
         ]
         avg_obs_len = sum(obs_lengths) / len(obs_lengths) if obs_lengths else 0.0
         total_memory_items = sum(len(items) for items in memory_step_items)
+        memory_feedback = self._memory_feedback_stats(task_data)
 
         # Token usage (optional)
         tokens = {}
@@ -167,6 +218,7 @@ class TrajectoryFeedbackAggregator:
                 "question_len": _safe_len(task_data.get("question", "")),
                 "avg_obs_len": avg_obs_len,
             },
+            "memory": memory_feedback,
         }
         if tokens:
             feedback["tokens"] = tokens
@@ -226,6 +278,17 @@ class TrajectoryFeedbackAggregator:
                 "answer_len": _avg(["text", "answer_len"]),
                 "question_len": _avg(["text", "question_len"]),
                 "avg_obs_len": _avg(["text", "avg_obs_len"]),
+            },
+            "memory": {
+                "events": _avg(["memory", "events"]),
+                "helpful": _avg(["memory", "helpful"]),
+                "neutral": _avg(["memory", "neutral"]),
+                "harmful": _avg(["memory", "harmful"]),
+                "stale": _avg(["memory", "stale"]),
+                "unsupported": _avg(["memory", "unsupported"]),
+                "harmful_rate": _avg(["memory", "harmful_rate"]),
+                "unsupported_rate": _avg(["memory", "unsupported_rate"]),
+                "stale_rate": _avg(["memory", "stale_rate"]),
             },
         }
         if has_tokens:

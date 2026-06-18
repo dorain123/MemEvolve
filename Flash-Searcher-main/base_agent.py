@@ -46,7 +46,8 @@ class BaseAgent:
                     "value": step.plan, 
                     "think": step.plan_think, 
                     "cot_think": step.plan_reasoning,
-                    "memory_guidance": step.memory_guidance
+                    "memory_guidance": step.memory_guidance,
+                    "memory_events": step.memory_events or [],
                 }
                 trajectory.append(traj)
             elif isinstance(step, SummaryStep):
@@ -60,7 +61,8 @@ class BaseAgent:
                     "obs": step.observations,
                     "think": step.action_think, 
                     "cot_think": step.action_reasoning,
-                    "memory_guidance": step.memory_guidance
+                    "memory_guidance": step.memory_guidance,
+                    "memory_events": step.memory_events or [],
                 }
                 trajectory.append(traj)
             else:

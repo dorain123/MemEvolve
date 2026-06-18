@@ -412,6 +412,7 @@ class MultiStepAgent:
         
         from EvolveLab.memory_types import MemoryStatus
         memory_guidance_content = self._get_memory_guidance(MemoryStatus.BEGIN, step_number=0)
+        memory_guidance_events = self._last_memory_events.copy() if memory_guidance_content else []
         if memory_guidance_content:
             formatted_memory = (
                 "————Memory System Guidance————\n"
@@ -445,7 +446,8 @@ class MultiStepAgent:
                 plan=plans_answer,
                 plan_think=plans_think,
                 plan_reasoning=think_content,
-                memory_guidance=memory_guidance_content
+                memory_guidance=memory_guidance_content,
+                memory_events=memory_guidance_events,
             )
         )
 
@@ -454,7 +456,8 @@ class MultiStepAgent:
             plan=plans_answer,
             plan_think=plans_think,
             plan_reasoning=think_content,
-            memory_guidance=memory_guidance_content
+            memory_guidance=memory_guidance_content,
+            memory_events=memory_guidance_events,
         )
 
 
@@ -586,6 +589,8 @@ class ToolCallingAgent(MultiStepAgent):
             raise AgentError(f"Yaml parse error：{e}")
         self.summary_interval = summary_interval
         self.memory_provider = memory_provider
+        self.memory_events = []
+        self._last_memory_events = []
 
     def initialize_system_prompt(self) -> str:
         system_prompt = populate_template(
@@ -598,6 +603,7 @@ class ToolCallingAgent(MultiStepAgent):
         if not self.memory_provider:
             return None
         
+        self._last_memory_events = []
         try:
             from EvolveLab.memory_types import MemoryRequest, MemoryItemType
             
@@ -615,8 +621,12 @@ class ToolCallingAgent(MultiStepAgent):
             if memory_response.memories:
                 text_contents = []
                 tools_without_description = []
+                memory_events = []
                 
                 for memory_item in memory_response.memories:
+                    event = self._build_memory_event(memory_item, memory_status, step_number)
+                    memory_events.append(event)
+                    
                     if memory_item.type == MemoryItemType.TEXT:
                         text_contents.append(memory_item.content)
                     elif memory_item.type == MemoryItemType.API:
@@ -663,12 +673,62 @@ class ToolCallingAgent(MultiStepAgent):
                     combined_parts.append(tools_section)
                 
                 if combined_parts:
+                    self._last_memory_events = memory_events
+                    self.memory_events.extend(memory_events)
                     return "\n".join(combined_parts)
             
         except Exception as e:
             logger.warning(f"Memory provider error: {e}")
         
         return None
+
+    def _safe_memory_metadata(self, metadata: Any) -> Dict[str, Any]:
+        if not isinstance(metadata, dict):
+            return {}
+        safe_metadata = {}
+        for key, value in metadata.items():
+            if key in {"wrapped_tool", "callable"}:
+                safe_metadata[key] = getattr(value, "name", str(type(value).__name__))
+            elif isinstance(value, (str, int, float, bool)) or value is None:
+                safe_metadata[key] = value
+            elif isinstance(value, (list, tuple)):
+                safe_metadata[key] = [
+                    item if isinstance(item, (str, int, float, bool)) or item is None else str(item)
+                    for item in value
+                ]
+            elif isinstance(value, dict):
+                safe_metadata[key] = {
+                    sub_key: sub_value if isinstance(sub_value, (str, int, float, bool)) or sub_value is None else str(sub_value)
+                    for sub_key, sub_value in value.items()
+                }
+            else:
+                safe_metadata[key] = str(value)
+        return safe_metadata
+
+    def _build_memory_event(self, memory_item: Any, memory_status: Any, step_number: int) -> Dict[str, Any]:
+        content = getattr(memory_item, "content", "")
+        if not isinstance(content, str):
+            content = str(content)
+        metadata = self._safe_memory_metadata(getattr(memory_item, "metadata", {}) or {})
+        provider = None
+        if self.memory_provider and hasattr(self.memory_provider, "get_memory_type"):
+            try:
+                provider_type = self.memory_provider.get_memory_type()
+                provider = getattr(provider_type, "value", str(provider_type))
+            except Exception:
+                provider = self.memory_provider.__class__.__name__
+        event = {
+            "memory_id": getattr(memory_item, "id", None),
+            "memory_type": getattr(getattr(memory_item, "type", None), "value", str(getattr(memory_item, "type", ""))),
+            "provider": provider,
+            "phase": getattr(memory_status, "value", str(memory_status)),
+            "step_number": step_number,
+            "score": getattr(memory_item, "score", None),
+            "content": content,
+            "content_preview": content[:500],
+            "metadata": metadata,
+        }
+        return event
 
     def _format_current_context(self) -> str:
         try:
@@ -703,6 +763,8 @@ class ToolCallingAgent(MultiStepAgent):
         """
         final_answer = None
         self.step_number = 0
+        self.memory_events = []
+        self._last_memory_events = []
         while final_answer is None and self.step_number <= self.max_steps:
             step_start_time = time.time()
             memory_step = ActionStep(
@@ -781,6 +843,7 @@ class ToolCallingAgent(MultiStepAgent):
 
         from EvolveLab.memory_types import MemoryStatus
         memory_guidance_content = self._get_memory_guidance(MemoryStatus.IN, step_number=self.step_number)
+        memory_guidance_events = self._last_memory_events.copy() if memory_guidance_content else []
         if memory_guidance_content:
             formatted_memory = (
                 "————Memory System Guidance————\n"
@@ -793,6 +856,7 @@ class ToolCallingAgent(MultiStepAgent):
             }
             memory_messages = memory_messages + [memory_message]
             memory_step.memory_guidance = memory_guidance_content
+            memory_step.memory_events = memory_guidance_events
 
         instruction_message = [{
             "role": MessageRole.USER,

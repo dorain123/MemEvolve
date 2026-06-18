@@ -111,6 +111,10 @@ class LightweightMemoryProvider(BaseMemoryProvider):
         self.shortterm_provision_interval = int(self.config.get("shortterm_provision_interval", 3))
         self.top_k_longterm = int(self.config.get("top_k_longterm", 5))
         self.enable_longterm_provision = bool(self.config.get("enable_longterm_provision", False))
+        self.longterm_min_confidence = float(self.config.get("longterm_min_confidence", 0.35))
+        self.begin_memory_budget_chars = int(self.config.get("begin_memory_budget_chars", 1600))
+        self.in_memory_budget_chars = int(self.config.get("in_memory_budget_chars", 900))
+        self.max_failure_patterns = int(self.config.get("max_failure_patterns", 30))
         
         # Memory buffer configuration (allow expansion before pruning)
         self.memory_buffer_size = int(self.config.get("memory_buffer_size", 20))
@@ -160,7 +164,8 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                         existing_db = json.load(f)
                         items_before = (
                             len(existing_db.get("strategic", [])) + 
-                            len(existing_db.get("operational", []))
+                            len(existing_db.get("operational", [])) +
+                            len(existing_db.get("failure_patterns", []))
                         )
                 except Exception:
                     pass
@@ -168,11 +173,13 @@ class LightweightMemoryProvider(BaseMemoryProvider):
             self.longterm_db = self._load_longterm_db()
             items_after = (
                 len(self.longterm_db.get("strategic", [])) + 
-                len(self.longterm_db.get("operational", []))
+                len(self.longterm_db.get("operational", [])) +
+                len(self.longterm_db.get("failure_patterns", []))
             )
             self.logger.info(
                 f"Long-term memory loaded: {len(self.longterm_db.get('strategic', []))} strategic, "
-                f"{len(self.longterm_db.get('operational', []))} operational "
+                f"{len(self.longterm_db.get('operational', []))} operational, "
+                f"{len(self.longterm_db.get('failure_patterns', []))} failure patterns "
                 f"(max: {self.max_strategic_memories}/{self.max_operational_memories}, "
                 f"trigger pruning at: {self.max_strategic_memories + self.memory_buffer_size}/"
                 f"{self.max_operational_memories + self.memory_buffer_size})"
@@ -304,6 +311,7 @@ class LightweightMemoryProvider(BaseMemoryProvider):
             # Extract full_query from metadata for snapshot matching (if available)
             metadata = trajectory_data.metadata or {}
             full_query = metadata.get("full_query") or trajectory_data.query
+            self._update_memory_feedback_counts(metadata.get("memory_feedback"))
             
             # Update success_count for used memories
             if is_success:
@@ -330,7 +338,11 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                         f"Added {strategic_added} strategic, {operational_added} operational memories"
                     )
             else:
-                self.logger.info("Trajectory not successful, skipping memory extraction")
+                self.logger.info("Trajectory not successful, extracting failure patterns...")
+                failure_patterns = self._extract_failure_patterns(trajectory_data)
+                failure_added = self._add_failure_patterns(failure_patterns or [])
+                absorbed_items.extend([f"failure_pattern:{i}" for i in range(failure_added)])
+                self.logger.info(f"Added {failure_added} failure pattern memories")
             
             # Save long-term database
             self._save_longterm_db()
@@ -381,37 +393,71 @@ class LightweightMemoryProvider(BaseMemoryProvider):
         try:
             strategic_memories = self.longterm_db.get("strategic", [])
             operational_memories = self.longterm_db.get("operational", [])
+            failure_patterns = self.longterm_db.get("failure_patterns", [])
             
-            if not strategic_memories and not operational_memories:
+            if not strategic_memories and not operational_memories and not failure_patterns:
                 self.logger.info("No long-term memories available")
                 return None
             
             # Build candidate list with scores
             candidates = []
             
-            for idx, mem in enumerate(strategic_memories):
-                candidates.append({
-                    "id": f"strategic_{idx}",
-                    "type": "strategic",
-                    "content": mem["content"],
-                    "usage_count": mem.get("usage_count", 0),
-                    "success_rate": self._calculate_success_rate(mem),
-                })
+            for memory_type, memory_list in [
+                ("strategic", strategic_memories),
+                ("operational", operational_memories),
+                ("failure_pattern", failure_patterns),
+            ]:
+                for idx, mem in enumerate(memory_list):
+                    if not isinstance(mem, dict):
+                        mem = self._normalize_memory_record(mem, memory_type=memory_type)
+                        memory_list[idx] = mem
+                    confidence = self._memory_confidence(mem)
+                    usage_count = mem.get("usage_count", 0)
+                    harmful_count = mem.get("harmful_count", 0)
+                    unsupported_count = mem.get("unsupported_count", 0)
+                    harmful_rate = harmful_count / usage_count if usage_count else 0.0
+                    
+                    if confidence < self.longterm_min_confidence and usage_count == 0:
+                        continue
+                    if usage_count >= 2 and harmful_rate >= 0.5:
+                        continue
+                    if unsupported_count >= 2 and mem.get("success_count", 0) == 0:
+                        continue
+                    
+                    candidates.append({
+                        "id": f"{memory_type}_{idx}",
+                        "type": memory_type,
+                        "content": mem.get("content", ""),
+                        "usage_count": usage_count,
+                        "success_rate": self._calculate_success_rate(mem),
+                        "harmful_rate": harmful_rate,
+                        "confidence": confidence,
+                        "applies_when": mem.get("applies_when", ""),
+                        "do_not_apply_when": mem.get("do_not_apply_when", ""),
+                        "provenance": mem.get("provenance", {}),
+                    })
             
-            for idx, mem in enumerate(operational_memories):
-                candidates.append({
-                    "id": f"operational_{idx}",
-                    "type": "operational",
-                    "content": mem["content"],
-                    "usage_count": mem.get("usage_count", 0),
-                    "success_rate": self._calculate_success_rate(mem),
-                })
+            if not candidates:
+                self.logger.info("No long-term memories passed gating")
+                return None
             
             # Use LLM to select and synthesize
-            guidance = self._select_and_synthesize_longterm(request, candidates)
+            guidance, selected_memory_ids = self._select_and_synthesize_longterm(request, candidates)
             
             if not guidance or not guidance.strip():
                 return None
+            
+            selected_candidates = [candidate for candidate in candidates if candidate["id"] in selected_memory_ids]
+            selected_confidences = [candidate.get("confidence", 0.45) for candidate in selected_candidates]
+            synthesized_confidence = min(selected_confidences) if selected_confidences else 0.45
+            synthesized_provenance = {
+                "source_url": None,
+                "source_type": "memory_synthesis",
+                "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "evidence_span": ", ".join(selected_memory_ids),
+                "confidence": synthesized_confidence,
+                "expires_at": None,
+            }
             
             self._memory_id_counter += 1
             memory_item = MemoryItem(
@@ -420,6 +466,23 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                 metadata={
                     "source": "lightweight_longterm",
                     "phase": "begin",
+                    "selected_memory_ids": selected_memory_ids,
+                    "budget_chars": self.begin_memory_budget_chars,
+                    "provenance": synthesized_provenance,
+                    "selected_provenance": [
+                        {
+                            "memory_id": candidate["id"],
+                            "provenance": candidate.get("provenance", {}),
+                            "confidence": candidate.get("confidence"),
+                            "applies_when": candidate.get("applies_when"),
+                            "do_not_apply_when": candidate.get("do_not_apply_when"),
+                        }
+                        for candidate in selected_candidates
+                    ],
+                    "gating": {
+                        "min_confidence": self.longterm_min_confidence,
+                        "candidate_count": len(candidates),
+                    },
                 },
                 type=MemoryItemType.TEXT,
             )
@@ -434,18 +497,26 @@ class LightweightMemoryProvider(BaseMemoryProvider):
         self, 
         request: MemoryRequest, 
         candidates: List[Dict[str, Any]]
-    ) -> str:
+    ) -> tuple[str, List[str]]:
         """Use LLM to select top-K memories and synthesize guidance"""
         if not candidates:
-            return ""
+            return "", []
         
         try:
             # Format candidates for LLM
             candidate_lines = []
             for i, c in enumerate(candidates, 1):
+                provenance = c.get("provenance") or {}
+                source_type = provenance.get("source_type", "unknown")
+                evidence_span = provenance.get("evidence_span", "")
                 candidate_lines.append(
-                    f"{i}. [{c['type'].upper()}] (Success Rate: {c['success_rate']:.1%})\n"
-                    f"   {c['content']}"
+                    f"{i}. [{c['type'].upper()}] "
+                    f"(Success: {c['success_rate']:.1%}, Harmful: {c['harmful_rate']:.1%}, "
+                    f"Confidence: {c['confidence']:.2f}, Source: {source_type})\n"
+                    f"   Content: {c['content']}\n"
+                    f"   Applies when: {c.get('applies_when') or 'not specified'}\n"
+                    f"   Do not apply when: {c.get('do_not_apply_when') or 'not specified'}\n"
+                    f"   Evidence: {evidence_span or 'not provided'}"
                 )
             
             prompt = f"""You are a memory guidance system. Select and synthesize the most relevant memories for this task.
@@ -457,15 +528,18 @@ class LightweightMemoryProvider(BaseMemoryProvider):
 {chr(10).join(candidate_lines)}
 
 **Your Tasks:**
-1. Select the top {self.top_k_longterm} most relevant memories (strategic or operational)
+1. Select the top {self.top_k_longterm} most relevant memories (strategic, operational, or failure-pattern cautions)
 2. Synthesize them into concise, actionable guidance
 
 **Synthesis Requirements:**
-- Keep it brief: 4-5 sentences maximum
-- Include both strategic and operational suggestions
+- Keep it within {self.begin_memory_budget_chars} characters
+- Include failure-pattern cautions only when their applies_when boundary matches this task
 - Combine related points, avoid redundancy
 - Use bullet points for readability
 - **IMPORTANT: Always frame as suggestions, not commands**: "Consider...", "Based on similar tasks...", "You might want to..."
+- Preserve applicability boundaries. If a memory has a "do_not_apply_when" condition that may fit, mention the caveat or skip it.
+- Prefer memories with clear provenance, higher confidence, and lower harmful rate.
+- Do not turn a task-specific fact into a general rule unless its provenance and applies_when justify it.
 **Output Format (JSON):**
 {{
   "selected_indices": [1, 3, 5],
@@ -486,19 +560,19 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                 guidance = result.get("guidance", "")
                 
                 # Update usage_count for selected memories
-                self._update_memory_usage(candidates, selected_indices)
+                selected_memory_ids = self._update_memory_usage(candidates, selected_indices)
                 
-                return guidance.strip()
+                return self._compact_text(guidance.strip(), self.begin_memory_budget_chars), selected_memory_ids
             else:
                 # Fallback: treat response as plain text guidance
                 self.logger.warning("Failed to parse JSON from LLM, treating as plain text")
-                return response.strip()
+                return self._compact_text(response.strip(), self.begin_memory_budget_chars), []
             
         except Exception as e:
             self.logger.error(f"Long-term synthesis error: {str(e)}", exc_info=True)
-            return ""
+            return "", []
 
-    def _update_memory_usage(self, candidates: List[Dict[str, Any]], selected_indices: List[int]) -> None:
+    def _update_memory_usage(self, candidates: List[Dict[str, Any]], selected_indices: List[int]) -> List[str]:
         """
         Update usage_count for selected memories and track them for success rate updates
         
@@ -506,8 +580,13 @@ class LightweightMemoryProvider(BaseMemoryProvider):
             candidates: List of memory candidates with id, type, content
             selected_indices: List of selected indices (1-based)
         """
+        selected_memory_ids = []
         try:
             for idx in selected_indices:
+                try:
+                    idx = int(idx)
+                except (TypeError, ValueError):
+                    continue
                 # Convert to 0-based index
                 if idx < 1 or idx > len(candidates):
                     continue
@@ -515,26 +594,16 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                 candidate = candidates[idx - 1]
                 memory_id = candidate["id"]
                 memory_type = candidate["type"]
+                selected_memory_ids.append(memory_id)
                 
                 # Track this memory for success rate updates later
                 self.task_context["used_memory_ids"].append(memory_id)
                 
                 # Update usage_count in the database
-                if memory_type == "strategic":
-                    memory_list = self.longterm_db["strategic"]
-                    # Extract index from id like "strategic_3"
-                    mem_idx = int(memory_id.split("_")[1])
-                    if 0 <= mem_idx < len(memory_list):
-                        memory_list[mem_idx]["usage_count"] = memory_list[mem_idx].get("usage_count", 0) + 1
-                        self.logger.debug(f"Updated usage_count for strategic memory {mem_idx}")
-                
-                elif memory_type == "operational":
-                    memory_list = self.longterm_db["operational"]
-                    # Extract index from id like "operational_2"
-                    mem_idx = int(memory_id.split("_")[1])
-                    if 0 <= mem_idx < len(memory_list):
-                        memory_list[mem_idx]["usage_count"] = memory_list[mem_idx].get("usage_count", 0) + 1
-                        self.logger.debug(f"Updated usage_count for operational memory {mem_idx}")
+                memory_list, mem_idx = self._resolve_memory_ref(memory_id)
+                if memory_list is not None and 0 <= mem_idx < len(memory_list):
+                    memory_list[mem_idx]["usage_count"] = memory_list[mem_idx].get("usage_count", 0) + 1
+                    self.logger.debug(f"Updated usage_count for {memory_type} memory {mem_idx}")
             
             # Save snapshot: preserve used_memory_ids for this task (keyed by query)
             # Always save snapshot (even if empty) to track that this task has been processed
@@ -550,6 +619,8 @@ class LightweightMemoryProvider(BaseMemoryProvider):
         
         except Exception as e:
             self.logger.warning(f"Error updating memory usage: {str(e)}")
+        
+        return selected_memory_ids
 
     # =========================================================================
     # Short-term Memory Auto-Extraction and Retrieval
@@ -742,7 +813,7 @@ Before extracting any item, ask: "Is this about the TASK CONTENT (data, constrai
             for idx, item in enumerate(self.shortterm_memory, 1):
                 content_lines.append(f"{idx}. {item}")
             
-            content = "\n".join(content_lines)
+            content = self._compact_text("\n".join(content_lines), self.in_memory_budget_chars)
             
             self._memory_id_counter += 1
             memory_item = MemoryItem(
@@ -752,6 +823,15 @@ Before extracting any item, ask: "Is this about the TASK CONTENT (data, constrai
                     "source": "lightweight_shortterm",
                     "phase": "in",
                     "item_count": len(self.shortterm_memory),
+                    "budget_chars": self.in_memory_budget_chars,
+                    "provenance": {
+                        "source_url": None,
+                        "source_type": "working_memory",
+                        "retrieved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                        "evidence_span": "Current task trajectory short-term extracts",
+                        "confidence": 0.6,
+                        "expires_at": None,
+                    },
                 },
                 type=MemoryItemType.TEXT,
             )
@@ -919,6 +999,60 @@ Only provide the JSON array, nothing else.
                 removed.append(self.shortterm_memory.pop(0))
             return removed
 
+    def _resolve_memory_ref(self, memory_id: str) -> tuple[Optional[List[Dict[str, Any]]], int]:
+        """Resolve a stored memory id such as strategic_3 or failure_pattern_2."""
+        if not memory_id or not isinstance(memory_id, str):
+            return None, -1
+        for prefix, db_key in [
+            ("failure_pattern_", "failure_patterns"),
+            ("strategic_", "strategic"),
+            ("operational_", "operational"),
+        ]:
+            if memory_id.startswith(prefix):
+                try:
+                    return self.longterm_db.get(db_key, []), int(memory_id[len(prefix):])
+                except ValueError:
+                    return None, -1
+        return None, -1
+
+    def _memory_confidence(self, memory: Dict[str, Any]) -> float:
+        provenance = memory.get("provenance") or {}
+        value = memory.get("confidence", provenance.get("confidence", 0.45))
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.45
+
+    def _update_memory_feedback_counts(self, memory_feedback: Optional[Dict[str, Any]]) -> None:
+        """Apply post-task labels back to the long-term memories that produced guidance."""
+        if not memory_feedback:
+            return
+        events = memory_feedback.get("events") if isinstance(memory_feedback, dict) else None
+        if not isinstance(events, list):
+            return
+
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            label = event.get("label")
+            metadata = event.get("metadata") or {}
+            selected_ids = metadata.get("selected_memory_ids") or []
+            if isinstance(selected_ids, str):
+                selected_ids = [selected_ids]
+            if not selected_ids and event.get("memory_id", "").startswith(("strategic_", "operational_", "failure_pattern_")):
+                selected_ids = [event.get("memory_id")]
+            
+            for memory_id in selected_ids:
+                memory_list, mem_idx = self._resolve_memory_ref(memory_id)
+                if memory_list is None or not (0 <= mem_idx < len(memory_list)):
+                    continue
+                memory = memory_list[mem_idx]
+                if label in {"helpful", "neutral", "harmful", "stale", "unsupported"}:
+                    count_key = f"{label}_count"
+                    memory[count_key] = memory.get(count_key, 0) + 1
+                memory["last_feedback_label"] = label
+                memory["last_feedback_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
     def _update_memory_success_count(self, query: Optional[str] = None) -> None:
         """
         Update success_count for all memories used in this successful task
@@ -955,27 +1089,12 @@ Only provide the JSON array, nothing else.
             updated_count = 0
             for memory_id in used_memory_ids:
                 try:
-                    # Parse memory_id like "strategic_3" or "operational_2"
-                    parts = memory_id.split("_")
-                    if len(parts) != 2:
+                    memory_list, mem_idx = self._resolve_memory_ref(memory_id)
+                    if memory_list is None or not (0 <= mem_idx < len(memory_list)):
                         continue
-                    
-                    memory_type = parts[0]
-                    mem_idx = int(parts[1])
-                    
-                    if memory_type == "strategic":
-                        memory_list = self.longterm_db["strategic"]
-                        if 0 <= mem_idx < len(memory_list):
-                            memory_list[mem_idx]["success_count"] = memory_list[mem_idx].get("success_count", 0) + 1
-                            updated_count += 1
-                            self.logger.debug(f"Updated success_count for strategic memory {mem_idx}")
-                    
-                    elif memory_type == "operational":
-                        memory_list = self.longterm_db["operational"]
-                        if 0 <= mem_idx < len(memory_list):
-                            memory_list[mem_idx]["success_count"] = memory_list[mem_idx].get("success_count", 0) + 1
-                            updated_count += 1
-                            self.logger.debug(f"Updated success_count for operational memory {mem_idx}")
+                    memory_list[mem_idx]["success_count"] = memory_list[mem_idx].get("success_count", 0) + 1
+                    updated_count += 1
+                    self.logger.debug(f"Updated success_count for memory {memory_id}")
                 
                 except (ValueError, IndexError) as e:
                     self.logger.warning(f"Error parsing memory_id {memory_id}: {str(e)}")
@@ -989,6 +1108,96 @@ Only provide the JSON array, nothing else.
     # =========================================================================
     # Memory Extraction and Storage
     # =========================================================================
+
+    def _normalize_memory_record(
+        self,
+        raw_memory: Any,
+        memory_type: str,
+        default_confidence: float = 0.45,
+    ) -> Dict[str, Any]:
+        """Normalize legacy strings and new structured memories into one schema."""
+        if isinstance(raw_memory, dict):
+            content = (
+                raw_memory.get("content")
+                or raw_memory.get("insight")
+                or raw_memory.get("pattern")
+                or raw_memory.get("text")
+                or ""
+            )
+            tags = raw_memory.get("tags") or self._extract_tags(str(content))
+            provenance = raw_memory.get("provenance") or {}
+            confidence = raw_memory.get("confidence", provenance.get("confidence", default_confidence))
+            applies_when = raw_memory.get("applies_when")
+            do_not_apply_when = raw_memory.get("do_not_apply_when")
+        else:
+            content = str(raw_memory)
+            tags = self._extract_tags(content)
+            provenance = {}
+            confidence = default_confidence
+            applies_when = None
+            do_not_apply_when = None
+
+        content = str(content).strip()
+        signature = self._compute_signature(content.lower())
+        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+        if not isinstance(provenance, dict):
+            provenance = {}
+        if isinstance(raw_memory, dict):
+            for field in ["source_url", "source_type", "retrieved_at", "evidence_span", "expires_at"]:
+                if raw_memory.get(field) and not provenance.get(field):
+                    provenance[field] = raw_memory.get(field)
+        provenance = {
+            "source_url": provenance.get("source_url"),
+            "source_type": provenance.get("source_type") or "trajectory",
+            "retrieved_at": provenance.get("retrieved_at") or now,
+            "evidence_span": provenance.get("evidence_span", ""),
+            "confidence": provenance.get("confidence", confidence),
+            "expires_at": provenance.get("expires_at"),
+        }
+
+        try:
+            confidence = float(confidence)
+        except (TypeError, ValueError):
+            confidence = default_confidence
+
+        if memory_type == "failure_pattern":
+            default_applies = "Use when a new task shows similar uncertainty, tool failure, evidence gaps, or boundary confusion."
+            default_do_not_apply = "Do not treat this as a factual conclusion; use it only as a caution/checklist."
+        else:
+            default_applies = "Use when the task constraints and evidence situation match this guidance."
+            default_do_not_apply = "Do not reuse task-specific facts without fresh evidence or matching applicability boundaries."
+
+        record = {
+            "content": content,
+            "tags": tags,
+            "usage_count": 0,
+            "success_count": 0,
+            "helpful_count": 0,
+            "neutral_count": 0,
+            "harmful_count": 0,
+            "stale_count": 0,
+            "unsupported_count": 0,
+            "signature": signature,
+            "memory_kind": memory_type,
+            "applies_when": applies_when or default_applies,
+            "do_not_apply_when": do_not_apply_when or default_do_not_apply,
+            "provenance": provenance,
+            "confidence": confidence,
+            "created_at": now,
+            "updated_at": now,
+        }
+
+        if isinstance(raw_memory, dict):
+            for key in [
+                "usage_count", "success_count", "helpful_count", "neutral_count",
+                "harmful_count", "stale_count", "unsupported_count", "created_at",
+                "updated_at", "signature",
+            ]:
+                if key in raw_memory:
+                    record[key] = raw_memory[key]
+
+        return record
 
     def _extract_memories(self, trajectory_data: TrajectoryData) -> Optional[Dict[str, Any]]:
         """Use LLM to extract strategic and operational memories from trajectory"""
@@ -1009,7 +1218,7 @@ Only provide the JSON array, nothing else.
 **Result:**
 {str(trajectory_data.result)}
 
-**Extract TWO types (max 2 each, 1-2 sentences):**
+**Extract TWO types (max 2 each):**
 
 **1. STRATEGIC (Task Planning & Method Selection):**
 - When/why to choose specific approaches
@@ -1025,8 +1234,34 @@ Example: "When web_search fails, try alternative query phrasings or search terms
 
 **Output (JSON):**
 {{
-  "strategic": ["insight 1", "insight 2"],
-  "operational": ["technique 1", "technique 2"]
+  "strategic": [
+    {{
+      "content": "Reusable planning insight.",
+      "applies_when": "Specific task/context boundary where this applies.",
+      "do_not_apply_when": "Boundary where this would mislead.",
+      "provenance": {{
+        "source_type": "trajectory",
+        "source_url": null,
+        "evidence_span": "Short quote or close paraphrase from the trajectory.",
+        "confidence": 0.55,
+        "expires_at": null
+      }}
+    }}
+  ],
+  "operational": [
+    {{
+      "content": "Reusable execution/tool insight.",
+      "applies_when": "Specific execution condition where this applies.",
+      "do_not_apply_when": "Boundary where this would mislead.",
+      "provenance": {{
+        "source_type": "trajectory",
+        "source_url": null,
+        "evidence_span": "Short quote or close paraphrase from the trajectory.",
+        "confidence": 0.55,
+        "expires_at": null
+      }}
+    }}
+  ]
 }}
 
 **Rules:**
@@ -1034,6 +1269,8 @@ Example: "When web_search fails, try alternative query phrasings or search terms
 - Strategic = planning/decisions, Operational = execution/handling
 - Only valuable insights, skip obvious points
 - Focus on the agent itself in the trajectory, ignore the guidance content of the memory system
+- Preserve applicability boundaries. A short memory that loses its boundary is worse than no memory.
+- Do not store factual claims unless they have source/evidence provenance and an explicit expiration/boundary.
 
 **Your Extraction:**"""
 
@@ -1054,7 +1291,114 @@ Example: "When web_search fails, try alternative query phrasings or search terms
         
         return None
 
-    def _add_strategic_memories(self, new_memories: List[str]) -> int:
+    def _extract_failure_patterns(self, trajectory_data: TrajectoryData) -> List[Dict[str, Any]]:
+        """Extract reusable cautions from failed trajectories without storing factual conclusions."""
+        if not self.model:
+            return []
+        
+        try:
+            trajectory_str = json.dumps(trajectory_data.trajectory or [], ensure_ascii=False)
+            metadata = trajectory_data.metadata or {}
+            memory_feedback = metadata.get("memory_feedback") or {}
+            
+            prompt = f"""Extract reusable failure patterns from this failed execution.
+
+**Task:**
+{trajectory_data.query}
+
+**Trajectory:**
+{trajectory_str}
+
+**Result:**
+{str(trajectory_data.result)}
+
+**Memory Feedback:**
+{json.dumps(memory_feedback, ensure_ascii=False)}
+
+**Extract up to 3 failure patterns.**
+
+Store only process-level cautions such as:
+- wrong assumption
+- tool/search failure or missing fallback
+- insufficient evidence
+- incomplete list/enumeration
+- stale/unsupported memory use
+- date/version boundary misunderstanding
+- lost applicability boundary
+
+Do NOT store factual conclusions from the failed trajectory.
+
+**Output (JSON array):**
+[
+  {{
+    "content": "Failure pattern or caution.",
+    "failure_type": "wrong_assumption | tool_failure | evidence_gap | incomplete_list | date_boundary | stale_memory | unsupported_memory | boundary_loss | other",
+    "applies_when": "Specific condition where this caution applies.",
+    "do_not_apply_when": "Condition where this caution would be irrelevant.",
+    "provenance": {{
+      "source_type": "failed_trajectory",
+      "source_url": null,
+      "evidence_span": "Short quote or close paraphrase from the trajectory.",
+      "confidence": 0.5,
+      "expires_at": null
+    }}
+  }}
+]
+
+**Your Extraction (JSON only):**"""
+
+            response = self._call_llm(prompt)
+            if not response or not response.strip():
+                return []
+            
+            extracted = self._parse_json_response(response)
+            if isinstance(extracted, list):
+                return extracted
+            if isinstance(extracted, dict):
+                patterns = extracted.get("failure_patterns") or extracted.get("patterns") or []
+                return patterns if isinstance(patterns, list) else []
+        
+        except Exception as e:
+            self.logger.warning(f"Failure pattern extraction error: {str(e)}")
+        
+        return []
+
+    def _add_failure_patterns(self, new_patterns: List[Any]) -> int:
+        """Add failure-pattern memories to long-term database."""
+        if not new_patterns:
+            return 0
+        
+        self.longterm_db.setdefault("failure_patterns", [])
+        added_count = 0
+        for raw_pattern in new_patterns:
+            record = self._normalize_memory_record(raw_pattern, memory_type="failure_pattern", default_confidence=0.5)
+            content = record["content"]
+            if len(content) < 20:
+                continue
+            if self._find_memory_by_signature(self.longterm_db["failure_patterns"], record["signature"]):
+                continue
+            if isinstance(raw_pattern, dict) and raw_pattern.get("failure_type"):
+                record["failure_type"] = raw_pattern.get("failure_type")
+                record["tags"] = list(set(record.get("tags", []) + [str(raw_pattern.get("failure_type"))]))
+            self.longterm_db["failure_patterns"].append(record)
+            added_count += 1
+        
+        current_count = len(self.longterm_db["failure_patterns"])
+        threshold = self.max_failure_patterns + self.memory_buffer_size
+        if current_count > threshold:
+            self.logger.info(
+                f"Failure-pattern memory buffer full ({current_count} > {threshold}), "
+                f"pruning to {self.max_failure_patterns}"
+            )
+            self._intelligent_prune_memories(
+                self.longterm_db["failure_patterns"],
+                self.max_failure_patterns,
+                memory_type="failure_pattern",
+            )
+        
+        return added_count
+
+    def _add_strategic_memories(self, new_memories: List[Any]) -> int:
         """
         Add strategic memories to long-term database
         
@@ -1068,24 +1412,18 @@ Example: "When web_search fails, try alternative query phrasings or search terms
         
         added_count = 0
         
-        for content in new_memories:
-            content = content.strip()
+        for raw_memory in new_memories:
+            record = self._normalize_memory_record(raw_memory, memory_type="strategic", default_confidence=0.55)
+            content = record["content"]
             if len(content) < 20:  # Skip too short
                 continue
             
             # Check for duplicates
-            signature = self._compute_signature(content.lower())
+            signature = record["signature"]
             if self._find_memory_by_signature(self.longterm_db["strategic"], signature):
                 continue
             
-            # Add new memory (no special flags needed)
-            self.longterm_db["strategic"].append({
-                "content": content,
-                "tags": self._extract_tags(content),
-                "usage_count": 0,
-                "success_count": 0,
-                "signature": signature,
-            })
+            self.longterm_db["strategic"].append(record)
             added_count += 1
         
         # Trigger pruning only when exceeding (max + buffer)
@@ -1105,7 +1443,7 @@ Example: "When web_search fails, try alternative query phrasings or search terms
         
         return added_count
 
-    def _add_operational_memories(self, new_memories: List[str]) -> int:
+    def _add_operational_memories(self, new_memories: List[Any]) -> int:
         """
         Add operational memories to long-term database
         
@@ -1119,24 +1457,18 @@ Example: "When web_search fails, try alternative query phrasings or search terms
         
         added_count = 0
         
-        for content in new_memories:
-            content = content.strip()
+        for raw_memory in new_memories:
+            record = self._normalize_memory_record(raw_memory, memory_type="operational", default_confidence=0.55)
+            content = record["content"]
             if len(content) < 20:  # Skip too short
                 continue
             
             # Check for duplicates
-            signature = self._compute_signature(content.lower())
+            signature = record["signature"]
             if self._find_memory_by_signature(self.longterm_db["operational"], signature):
                 continue
             
-            # Add new memory (no special flags needed)
-            self.longterm_db["operational"].append({
-                "content": content,
-                "tags": self._extract_tags(content),
-                "usage_count": 0,
-                "success_count": 0,
-                "signature": signature,
-            })
+            self.longterm_db["operational"].append(record)
             added_count += 1
         
         # Trigger pruning only when exceeding (max + buffer)
@@ -1224,9 +1556,15 @@ Example: "When web_search fails, try alternative query phrasings or search terms
             for idx, mem in enumerate(memory_list):
                 usage = mem.get("usage_count", 0)
                 success = mem.get("success_count", 0)
+                harmful = mem.get("harmful_count", 0)
+                unsupported = mem.get("unsupported_count", 0)
+                stale = mem.get("stale_count", 0)
                 success_rate = (success / usage * 100) if usage > 0 else 0
                 
-                status = f"Used:{usage}, Success:{success}, Rate:{success_rate:.0f}%"
+                status = (
+                    f"Used:{usage}, Success:{success}, Rate:{success_rate:.0f}%, "
+                    f"Harmful:{harmful}, Unsupported:{unsupported}, Stale:{stale}"
+                )
                 memory_lines.append(
                     f"{idx + 1}. [{status}]\n   {mem['content']}"
                 )
@@ -1245,6 +1583,7 @@ Example: "When web_search fails, try alternative query phrasings or search terms
 1. **Performance Metrics:**
    - Low usage count = rarely relevant
    - Low success rate = not helpful when used
+   - High harmful/unsupported/stale count = risky or poorly supported
    - Zero usage = never proven useful
    - Compare: Memory with 0 usage < Memory with low success rate < Memory with high success rate
    
@@ -1264,8 +1603,9 @@ Example: "When web_search fails, try alternative query phrasings or search terms
 
 **Removal Strategy:**
 - Priority 1: Zero-usage memories (haven't proven value)
-- Priority 2: Low success rate (used but unhelpful)
-- Priority 3: Redundant or vague content
+- Priority 2: Memories with harmful, unsupported, or stale feedback
+- Priority 3: Low success rate (used but unhelpful)
+- Priority 4: Redundant or vague content
 - Keep: High usage + high success rate memories
 
 **Output Format (JSON array of indices to REMOVE):**
@@ -1313,7 +1653,7 @@ Provide ONLY the JSON array, nothing else.
         """
         Fallback pruning: simple score-based removal
         
-        Score: success_count * 2 + usage_count
+        Score: success_count * 2 + usage_count - harmful_count * 3 - unsupported_count - stale_count
         
         This gives priority to memories that have been successfully used.
         Memories with zero usage will have score 0 and be removed first.
@@ -1325,7 +1665,16 @@ Provide ONLY the JSON array, nothing else.
         for mem in memory_list:
             success_count = mem.get("success_count", 0)
             usage_count = mem.get("usage_count", 0)
-            mem["_score"] = success_count * 2 + usage_count
+            harmful_count = mem.get("harmful_count", 0)
+            unsupported_count = mem.get("unsupported_count", 0)
+            stale_count = mem.get("stale_count", 0)
+            mem["_score"] = (
+                success_count * 2
+                + usage_count
+                - harmful_count * 3
+                - unsupported_count
+                - stale_count
+            )
         
         # Sort by score (descending) and keep top max_size
         memory_list.sort(key=lambda x: x["_score"], reverse=True)
@@ -1416,11 +1765,32 @@ Provide ONLY the JSON array, nothing else.
             db = {
                 "strategic": [],
                 "operational": [],
+                "failure_patterns": [],
                 "meta": {"version": 1}
             }
         
+        db.setdefault("strategic", [])
+        db.setdefault("operational", [])
+        db.setdefault("failure_patterns", [])
+        db.setdefault("meta", {"version": 1})
+        
+        for memory_type, db_key in [
+            ("strategic", "strategic"),
+            ("operational", "operational"),
+            ("failure_pattern", "failure_patterns"),
+        ]:
+            db[db_key] = [
+                self._normalize_memory_record(mem, memory_type=memory_type)
+                for mem in db.get(db_key, [])
+            ]
+        db["meta"]["version"] = max(int(db["meta"].get("version", 1)), 2)
+        
         # Inject cold-start memories if database is empty
-        if len(db.get("strategic", [])) == 0 and len(db.get("operational", [])) == 0:
+        if (
+            len(db.get("strategic", [])) == 0
+            and len(db.get("operational", [])) == 0
+            and len(db.get("failure_patterns", [])) == 0
+        ):
             self.logger.info("Empty memory database detected, injecting cold-start memories...")
             db = self._inject_coldstart_memories(db)
             self.logger.info(
@@ -1433,24 +1803,16 @@ Provide ONLY the JSON array, nothing else.
     def _inject_coldstart_memories(self, db: Dict[str, Any]) -> Dict[str, Any]:
         """Inject cold-start memories into an empty database"""
         for mem in COLDSTART_STRATEGIC_MEMORIES:
-            signature = self._compute_signature(mem["content"].lower())
-            db["strategic"].append({
-                "content": mem["content"],
-                "tags": mem.get("tags", []),
-                "usage_count": 0,
-                "success_count": 0,
-                "signature": signature,
-            })
+            record = self._normalize_memory_record(mem, memory_type="strategic", default_confidence=0.5)
+            record["applies_when"] = mem.get("applies_when", record["applies_when"])
+            record["do_not_apply_when"] = mem.get("do_not_apply_when", record["do_not_apply_when"])
+            db["strategic"].append(record)
         
         for mem in COLDSTART_OPERATIONAL_MEMORIES:
-            signature = self._compute_signature(mem["content"].lower())
-            db["operational"].append({
-                "content": mem["content"],
-                "tags": mem.get("tags", []),
-                "usage_count": 0,
-                "success_count": 0,
-                "signature": signature,
-            })
+            record = self._normalize_memory_record(mem, memory_type="operational", default_confidence=0.5)
+            record["applies_when"] = mem.get("applies_when", record["applies_when"])
+            record["do_not_apply_when"] = mem.get("do_not_apply_when", record["do_not_apply_when"])
+            db["operational"].append(record)
         
         return db
 
@@ -1578,6 +1940,11 @@ Provide ONLY the JSON array, nothing else.
             "shortterm_items": len(self.shortterm_memory),
             "longterm_provided": self.task_context["longterm_provided"],
             "agent_steps": self.task_context["agent_steps"],
+            "longterm_counts": {
+                "strategic": len((self.longterm_db or {}).get("strategic", [])),
+                "operational": len((self.longterm_db or {}).get("operational", [])),
+                "failure_patterns": len((self.longterm_db or {}).get("failure_patterns", [])),
+            },
         }
 
     def _call_llm(self, prompt: str) -> str:

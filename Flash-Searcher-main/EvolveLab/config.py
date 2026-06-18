@@ -49,7 +49,11 @@ DEFAULT_CONFIG = {
             "max_shortterm_items": 15,
             "shortterm_provision_interval": 5,
             "top_k_longterm": 3,
-            "enable_longterm_provision": False,
+            "enable_longterm_provision": True,
+            "longterm_min_confidence": 0.35,
+            "begin_memory_budget_chars": 1600,
+            "in_memory_budget_chars": 900,
+            "max_failure_patterns": 30,
         },
         MemoryType.CEREBRA_FUSION_MEMORY: {
             "model": None,

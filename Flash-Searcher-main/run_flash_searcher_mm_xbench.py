@@ -174,6 +174,197 @@ def grade_question(question_text, correct_answer, llm_response, judge_model):
     return score, extract_match, explain_match
 
 
+def safe_text(value):
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (dict, list)):
+        try:
+            return json.dumps(value, ensure_ascii=False)
+        except Exception:
+            return str(value)
+    return str(value)
+
+
+def collect_memory_events(search_agent=None, result=None):
+    events = []
+    seen = set()
+
+    def add_event(event):
+        if not isinstance(event, dict):
+            return
+        copied = dict(event)
+        key = (
+            copied.get("memory_id"),
+            copied.get("phase"),
+            copied.get("step_number"),
+            safe_text(copied.get("content") or copied.get("content_preview"))[:200],
+        )
+        if key in seen:
+            return
+        seen.add(key)
+        copied["event_index"] = len(events)
+        events.append(copied)
+
+    try:
+        runtime_events = getattr(getattr(search_agent, "agent_fn", None), "memory_events", [])
+        for event in runtime_events or []:
+            add_event(event)
+    except Exception:
+        pass
+
+    for step in (result or {}).get("agent_trajectory", []) or []:
+        for event in step.get("memory_events", []) or []:
+            add_event(event)
+
+    return events
+
+
+def get_memory_provenance(event):
+    metadata = event.get("metadata") or {}
+    provenance = metadata.get("provenance") or {}
+    if not isinstance(provenance, dict):
+        provenance = {}
+
+    return {
+        "source_url": metadata.get("source_url") or provenance.get("source_url"),
+        "source_type": metadata.get("source_type") or provenance.get("source_type"),
+        "retrieved_at": metadata.get("retrieved_at") or provenance.get("retrieved_at"),
+        "evidence_span": metadata.get("evidence_span") or provenance.get("evidence_span"),
+        "confidence": metadata.get("confidence") or provenance.get("confidence"),
+        "expires_at": metadata.get("expires_at") or provenance.get("expires_at"),
+    }
+
+
+def parse_datetime(value):
+    if not value:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value)
+        except Exception:
+            return None
+    if not isinstance(value, str):
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized).replace(tzinfo=None)
+    except Exception:
+        return None
+
+
+def token_overlap_ratio(left, right):
+    left_tokens = set(re.findall(r"[A-Za-z0-9_\u4e00-\u9fff]{2,}", safe_text(left).lower()))
+    right_tokens = set(re.findall(r"[A-Za-z0-9_\u4e00-\u9fff]{2,}", safe_text(right).lower()))
+    if not left_tokens or not right_tokens:
+        return 0.0
+    return len(left_tokens & right_tokens) / max(1, min(len(left_tokens), len(right_tokens)))
+
+
+def memory_looks_fact_like(event):
+    metadata = event.get("metadata") or {}
+    memory_kind = safe_text(
+        metadata.get("memory_kind")
+        or metadata.get("kind")
+        or metadata.get("category")
+        or metadata.get("memory_category")
+    ).lower()
+    if any(name in memory_kind for name in ["semantic", "fact", "factual", "entity", "source"]):
+        return True
+
+    content = safe_text(event.get("content") or event.get("content_preview"))
+    fact_patterns = [
+        r"\b(19|20)\d{2}\b",
+        r"\b\d+(\.\d+)?\s*(%|km|kg|miles|million|billion)\b",
+        r"https?://",
+        r"\b(rank|ranking|year|date|flight|paper|citation|version)\b",
+    ]
+    return any(re.search(pattern, content, re.IGNORECASE) for pattern in fact_patterns)
+
+
+def evaluate_memory_events(memory_events, is_correct, agent_response, extracted_answer="", grader_explanation="", status="success"):
+    labeled_events = []
+    counts = {"helpful": 0, "neutral": 0, "harmful": 0, "stale": 0, "unsupported": 0}
+    response_text = " ".join([safe_text(agent_response), safe_text(extracted_answer), safe_text(grader_explanation)])
+    task_failed = status != "success" or not is_correct
+    now = datetime.utcnow()
+
+    for event in memory_events or []:
+        labeled = dict(event)
+        metadata = labeled.get("metadata") or {}
+        provenance = get_memory_provenance(labeled)
+        content = safe_text(labeled.get("content") or labeled.get("content_preview"))
+        overlap = token_overlap_ratio(content, response_text)
+        confidence = provenance.get("confidence")
+        try:
+            confidence = float(confidence) if confidence is not None else None
+        except (TypeError, ValueError):
+            confidence = None
+
+        reasons = []
+        expires_at = parse_datetime(provenance.get("expires_at"))
+        is_stale = bool(expires_at and expires_at < now)
+        has_provenance = any(
+            provenance.get(field)
+            for field in ["source_url", "source_type", "retrieved_at", "evidence_span"]
+        )
+        is_fact_like = memory_looks_fact_like(labeled)
+        is_unsupported = bool(is_fact_like and not has_provenance)
+        is_low_confidence = bool(confidence is not None and confidence < 0.35)
+
+        if task_failed and overlap >= 0.12:
+            label = "harmful"
+            reasons.append(f"failed task response overlaps with injected memory ({overlap:.2f})")
+            if is_stale:
+                reasons.append("memory provenance has an expired expires_at")
+            if is_unsupported:
+                reasons.append("fact-like memory was injected without source/evidence provenance")
+            if is_low_confidence:
+                reasons.append(f"memory confidence is low ({confidence:.2f})")
+        elif is_stale:
+            label = "stale"
+            reasons.append("memory provenance has an expired expires_at")
+        elif is_unsupported or is_low_confidence:
+            label = "unsupported"
+            if is_unsupported:
+                reasons.append("fact-like memory was injected without source/evidence provenance")
+            if is_low_confidence:
+                reasons.append(f"memory confidence is low ({confidence:.2f})")
+        elif task_failed and metadata.get("risk") in {"harmful", "unsafe", "misleading"}:
+            label = "harmful"
+            reasons.append("memory metadata already marks this item as risky")
+        elif is_correct and overlap >= 0.12:
+            label = "helpful"
+            reasons.append(f"correct task response used content overlapping injected memory ({overlap:.2f})")
+        else:
+            label = "neutral"
+            reasons.append("no clear positive or negative contribution detected")
+
+        labeled["label"] = label
+        labeled["label_reasons"] = reasons
+        labeled["quality_flags"] = {
+            "stale": is_stale,
+            "unsupported": is_unsupported,
+            "low_confidence": is_low_confidence,
+            "fact_like": is_fact_like,
+            "overlap_with_response": overlap,
+        }
+        labeled["provenance"] = provenance
+        labeled_events.append(labeled)
+        counts[label] += 1
+
+    total = len(labeled_events)
+    summary = {
+        "total": total,
+        **counts,
+        "harmful_rate": counts["harmful"] / total if total else 0.0,
+        "unsupported_rate": counts["unsupported"] / total if total else 0.0,
+        "stale_rate": counts["stale"] / total if total else 0.0,
+    }
+    return {"events": labeled_events, "summary": summary}
+
+
 def load_memory_provider(memory_type_str, model=None):
     """Load and initialize memory provider from type string"""
     if not memory_type_str:
@@ -248,6 +439,17 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps, 
             agent_messages = []
         
         trajectory = result.get("agent_trajectory", [])
+        agent_result = result.get("agent_result", "")
+        if agent_result is None:
+            agent_response = ""
+        elif isinstance(agent_result, dict):
+            agent_response = agent_result.get("answer", "")
+            if not agent_response:
+                agent_response = json.dumps(agent_result, ensure_ascii=False)
+        else:
+            agent_response = safe_text(agent_result)
+        if not isinstance(agent_response, str):
+            agent_response = safe_text(agent_response)
         
         is_correct = False
         score = 0
@@ -255,19 +457,6 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps, 
         grader_explanation = ""
         if judge_model:
             try:
-                agent_result = result.get("agent_result", "")
-                if agent_result is None:
-                    agent_response = ""
-                elif isinstance(agent_result, dict):
-                    agent_response = agent_result.get("answer", "")
-                    if not agent_response:
-                        agent_response = json.dumps(agent_result, ensure_ascii=False)
-                else:
-                    agent_response = str(agent_result) if agent_result else ""
-                
-                if not isinstance(agent_response, str):
-                    agent_response = str(agent_response) if agent_response else ""
-                
                 score, extracted_answer, grader_explanation = grade_question(
                     question,
                     golden_answer,
@@ -280,6 +469,16 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps, 
                 score = 0
                 extracted_answer = ""
                 grader_explanation = f"Error: {str(e)}"
+
+        memory_events = collect_memory_events(search_agent, result)
+        memory_feedback = evaluate_memory_events(
+            memory_events,
+            is_correct=is_correct,
+            agent_response=agent_response,
+            extracted_answer=extracted_answer,
+            grader_explanation=grader_explanation,
+            status="success",
+        )
         
         if memory_provider and enable_memory_evolution:
             try:
@@ -292,6 +491,7 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps, 
                         "status": "success",
                         "is_correct": is_correct,
                         "full_query": question,
+                        "memory_feedback": memory_feedback,
                     }
                 )
                 success, msg = memory_provider.take_in_memory(trajectory_data)
@@ -314,6 +514,8 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps, 
             "score": score,
             "extracted_answer": extracted_answer,
             "grader_explanation": grader_explanation,
+            "memory_events": memory_feedback["events"],
+            "memory_feedback": memory_feedback["summary"],
             **result,
         }
         
@@ -329,6 +531,15 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps, 
             agent_messages = search_agent.agent_fn.write_memory_to_messages(include_system_prompt=False)
         except Exception:
             agent_messages = []
+        memory_events = collect_memory_events(search_agent)
+        memory_feedback = evaluate_memory_events(
+            memory_events,
+            is_correct=False,
+            agent_response="",
+            extracted_answer="",
+            grader_explanation=str(e),
+            status="error",
+        )
         
         if memory_provider and enable_memory_evolution:
             try:
@@ -341,6 +552,7 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps, 
                         "status": "error",
                         "is_correct": False,
                         "full_query": question,
+                        "memory_feedback": memory_feedback,
                     }
                 )
                 success, msg = memory_provider.take_in_memory(trajectory_data)
@@ -365,6 +577,8 @@ def process_item(item, model_config, summary_interval, prompts_type, max_steps, 
             "score": 0,
             "extracted_answer": "",
             "grader_explanation": f"Error: {str(e)}",
+            "memory_events": memory_feedback["events"],
+            "memory_feedback": memory_feedback["summary"],
         }
         
         timer.stop()

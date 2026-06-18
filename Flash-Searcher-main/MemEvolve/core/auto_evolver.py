@@ -627,7 +627,7 @@ class AutoEvolver:
         Multi-objective optimization:
         - Primary objective: Task success rate (accuracy, higher is better)
         - Secondary objectives: Computational cost (total_tokens, lower is better), 
-          execution time (elapsed_time, lower is better)
+          execution time (elapsed_time, lower is better), harmful memory rate (lower is better)
         
         Steps:
         1. Extract multi-dimensional metric vectors for each architecture
@@ -645,6 +645,7 @@ class AutoEvolver:
             # Extract metrics (for minimization objectives, we keep original values)
             accuracy = summary.get("accuracy", 0.0)  # Higher is better
             total_tokens = summary.get("tokens", {}).get("total_tokens", 999999)
+            harmful_rate = summary.get("memory", {}).get("harmful_rate", 0.0)
             
             # Calculate average execution time from per_task data or original log files
             avg_execution_time = self._compute_avg_execution_time(res)
@@ -654,6 +655,7 @@ class AutoEvolver:
                 "accuracy": accuracy,  # Higher is better
                 "total_tokens": total_tokens,  # Lower is better
                 "execution_time": avg_execution_time,  # Lower is better
+                "harmful_rate": harmful_rate,  # Lower is better
             })
         
         if not candidates:
@@ -666,15 +668,26 @@ class AutoEvolver:
             Dominance relationship: candidate1 is no worse than candidate2 on all objectives,
             and strictly better on at least one objective.
             """
-            # For "higher is better" objectives (accuracy), require candidate1 >= candidate2
-            # For "lower is better" objectives (tokens, execution_time), require candidate1 <= candidate2
-            acc1, tok1, time1 = candidate1["accuracy"], candidate1["total_tokens"], candidate1["execution_time"]
-            acc2, tok2, time2 = candidate2["accuracy"], candidate2["total_tokens"], candidate2["execution_time"]
+            # For "higher is better" objectives (accuracy), require candidate1 >= candidate2.
+            # For "lower is better" objectives (tokens, execution_time, harmful_rate),
+            # require candidate1 <= candidate2.
+            acc1, tok1, time1, harm1 = (
+                candidate1["accuracy"],
+                candidate1["total_tokens"],
+                candidate1["execution_time"],
+                candidate1["harmful_rate"],
+            )
+            acc2, tok2, time2, harm2 = (
+                candidate2["accuracy"],
+                candidate2["total_tokens"],
+                candidate2["execution_time"],
+                candidate2["harmful_rate"],
+            )
             
             # candidate1 is no worse than candidate2 on all objectives
-            not_worse = (acc1 >= acc2 and tok1 <= tok2 and time1 <= time2)
+            not_worse = (acc1 >= acc2 and tok1 <= tok2 and time1 <= time2 and harm1 <= harm2)
             # candidate1 is strictly better than candidate2 on at least one objective
-            strictly_better = (acc1 > acc2 or tok1 < tok2 or time1 < time2)
+            strictly_better = (acc1 > acc2 or tok1 < tok2 or time1 < time2 or harm1 < harm2)
             
             return not_worse and strictly_better
         
@@ -707,13 +720,15 @@ class AutoEvolver:
             """
             Compute weighted composite score for breaking ties.
             Weight settings:
-            - accuracy: 0.6 (primary objective)
-            - token efficiency: 0.25 (cost)
-            - execution time efficiency: 0.15 (latency)
+            - accuracy: 0.55 (primary objective)
+            - token efficiency: 0.20 (cost)
+            - execution time efficiency: 0.10 (latency)
+            - memory safety: 0.15 (lower harmful rate)
             """
             accuracy = candidate["accuracy"]
             tokens = candidate["total_tokens"]
             execution_time = candidate["execution_time"]
+            harmful_rate = candidate["harmful_rate"]
             
             # Get max and min values for all candidates for min-max normalization
             all_tokens = [c["total_tokens"] for c in candidates]
@@ -737,9 +752,15 @@ class AutoEvolver:
             else:
                 time_normalized = 1.0  # All values are the same, give full score
             time_score = time_normalized
+            memory_safety_score = max(0.0, min(1.0, 1.0 - harmful_rate))
             
             # Weighted composite score
-            score = 0.6 * accuracy + 0.25 * token_score + 0.15 * time_score
+            score = (
+                0.55 * accuracy
+                + 0.20 * token_score
+                + 0.10 * time_score
+                + 0.15 * memory_safety_score
+            )
             return score
         
         # Sort by rank and composite score
@@ -776,10 +797,11 @@ class AutoEvolver:
             summary = res.get("summary", {})
             accuracy = summary.get("accuracy", 0)
             total_tokens = summary.get("tokens", {}).get("total_tokens", 999999)
-            scored.append((provider, accuracy, total_tokens))
+            harmful_rate = summary.get("memory", {}).get("harmful_rate", 0.0)
+            scored.append((provider, accuracy, harmful_rate, total_tokens))
         
-        scored.sort(key=lambda x: (-x[1], x[2]))
-        return [p for p, _, _ in scored[:k]]
+        scored.sort(key=lambda x: (-x[1], x[2], x[3]))
+        return [p for p, _, _, _ in scored[:k]]
 
     def _select_tasks(self, start_idx: int, count: int) -> List[int]:
         """Select tasks from dataset"""

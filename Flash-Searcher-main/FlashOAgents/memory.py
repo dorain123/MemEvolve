@@ -73,6 +73,7 @@ class ActionStep(MemoryStep):
     score: float = 0.0
     evaluate_thought: str | None = None
     memory_guidance: str | None = None
+    memory_events: List[Dict[str, Any]] | None = None
     
     def dict(self):
         return {
@@ -90,6 +91,8 @@ class ActionStep(MemoryStep):
             "action_reasoning": self.action_reasoning,
             "score": self.score,
             "evaluate_thought": self.evaluate_thought,
+            "memory_guidance": self.memory_guidance,
+            "memory_events": self.memory_events or [],
         }
 
     def to_messages(self, summary_mode: bool = False, show_model_input_messages: bool = False) -> List[Message]:
@@ -161,6 +164,17 @@ class PlanningStep(MemoryStep):
     plan_think: str
     plan_reasoning: str
     memory_guidance: str | None = None
+    memory_events: List[Dict[str, Any]] | None = None
+
+    def dict(self):
+        return {
+            "model_input_messages": self.model_input_messages,
+            "plan": self.plan,
+            "plan_think": self.plan_think,
+            "plan_reasoning": self.plan_reasoning,
+            "memory_guidance": self.memory_guidance,
+            "memory_events": self.memory_events or [],
+        }
 
     def to_messages(self, summary_mode: bool, **kwargs) -> List[Message]:
         messages = []
