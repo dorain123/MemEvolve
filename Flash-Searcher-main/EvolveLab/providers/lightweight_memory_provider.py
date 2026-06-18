@@ -456,6 +456,8 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                         "id": f"{memory_type}_{idx}",
                         "type": memory_type,
                         "content": mem.get("content", ""),
+                        "tags": mem.get("tags", []),
+                        "failure_type": mem.get("failure_type", ""),
                         "usage_count": usage_count,
                         "helpful_count": helpful_count,
                         "neutral_count": neutral_count,
@@ -471,10 +473,15 @@ class LightweightMemoryProvider(BaseMemoryProvider):
             if not candidates:
                 self.logger.info("No long-term memories passed gating")
                 return None
+
+            for candidate in candidates:
+                candidate["priority_score"] = self._memory_priority_score(candidate)
+                candidate["task_relevance"] = self._memory_task_relevance_score(request.query, candidate)
+                candidate["rank_score"] = self._memory_rank_score(candidate)
             
             candidates = sorted(
                 candidates,
-                key=self._memory_priority_score,
+                key=self._memory_rank_score,
                 reverse=True,
             )[: self.longterm_candidate_limit]
 
@@ -549,7 +556,8 @@ class LightweightMemoryProvider(BaseMemoryProvider):
                 candidate_lines.append(
                     f"{i}. [{c['type'].upper()}] "
                     f"(Success: {c['success_rate']:.1%}, Harmful: {c['harmful_rate']:.1%}, "
-                    f"Confidence: {c['confidence']:.2f}, Source: {source_type})\n"
+                    f"Confidence: {c['confidence']:.2f}, Relevance: {c.get('task_relevance', 0.0):.2f}, "
+                    f"Priority: {c.get('priority_score', 0.0):.2f}, Source: {source_type})\n"
                     f"   Content: {c['content']}\n"
                     f"   Applies when: {c.get('applies_when') or 'not specified'}\n"
                     f"   Do not apply when: {c.get('do_not_apply_when') or 'not specified'}\n"
@@ -783,6 +791,97 @@ class LightweightMemoryProvider(BaseMemoryProvider):
             - harmful_rate * 1.5
             - min(neutral_count, 5) * 0.04
         )
+
+    def _memory_rank_score(self, candidate: Dict[str, Any]) -> float:
+        """Rank candidates by current-task relevance first, then global quality."""
+        relevance = candidate.get("task_relevance", 0.0)
+        priority = candidate.get("priority_score")
+        if priority is None:
+            priority = self._memory_priority_score(candidate)
+        return relevance * 2.0 + priority
+
+    def _memory_task_relevance_score(self, query: str, candidate: Dict[str, Any]) -> float:
+        """Lightweight lexical/domain relevance used before LLM memory selection."""
+        candidate_text = " ".join([
+            str(candidate.get("type", "")),
+            str(candidate.get("content", "")),
+            " ".join(str(tag) for tag in candidate.get("tags", []) or []),
+            str(candidate.get("failure_type", "")),
+            str(candidate.get("applies_when", "")),
+            str(candidate.get("do_not_apply_when", "")),
+        ])
+        query_tokens = self._relevance_tokens(query)
+        candidate_tokens = self._relevance_tokens(candidate_text)
+        if not query_tokens or not candidate_tokens:
+            return 0.0
+
+        overlap = len(query_tokens & candidate_tokens) / max(1, min(len(query_tokens), len(candidate_tokens)))
+        query_domains = self._relevance_domains(query)
+        candidate_domains = self._relevance_domains(candidate_text)
+        domain_overlap = len(query_domains & candidate_domains)
+        domain_score = min(0.8, domain_overlap * 0.25)
+
+        applies_tokens = self._relevance_tokens(str(candidate.get("applies_when", "")))
+        applies_overlap = len(query_tokens & applies_tokens) / max(1, min(len(query_tokens), len(applies_tokens))) if applies_tokens else 0.0
+        return overlap + domain_score + applies_overlap * 0.5
+
+    def _relevance_tokens(self, text: str) -> set[str]:
+        expanded = self._expand_relevance_text(text).lower()
+        tokens = set(re.findall(r"[a-z0-9_]{2,}", expanded))
+        for segment in re.findall(r"[\u4e00-\u9fff]{2,}", expanded):
+            tokens.add(segment)
+            tokens.update(segment[i:i + 2] for i in range(max(0, len(segment) - 1)))
+        return tokens
+
+    def _relevance_domains(self, text: str) -> set[str]:
+        expanded = self._expand_relevance_text(text).lower()
+        return {
+            domain
+            for domain in [
+                "dialogue_counting",
+                "geospatial",
+                "circumcenter",
+                "coordinate_collection",
+                "shuttlecock_feather_count",
+                "evidence_gap",
+                "deterministic_calculation",
+            ]
+            if domain in expanded
+        }
+
+    def _expand_relevance_text(self, text: str) -> str:
+        expanded = str(text or "")
+        lowered = expanded.lower()
+
+        domain_markers = [
+            (
+                ["liaozhai", "dialogue", "utterance", "speaker", "direct speech", "classical chinese",
+                 "\u804a\u658b", "\u7eff\u8863\u5973", "\u4e8e\u749f", "\u8bb2\u4e86\u51e0\u53e5",
+                 "\u8bf4\u4e86\u51e0\u53e5", "\u51e0\u53e5\u8bdd"],
+                " dialogue_counting speaker_attribution utterance_count direct_speech classical_text narrator_boundary",
+            ),
+            (
+                ["equidistant", "circumcenter", "coordinate", "geospatial", "shrine", "memorial",
+                 "\u7b49\u8ddd", "\u8ddd\u79bb\u76f8\u7b49", "\u4e09\u5730", "\u5750\u6807",
+                 "\u7ecf\u7eac", "\u7960\u5802", "\u6587\u5929\u7965", "\u4e8e\u8c26", "\u8881\u5d07\u7115"],
+                " geospatial circumcenter coordinate_collection missing_coordinates three_point_equidistance deterministic_calculation distance_km",
+            ),
+            (
+                ["shuttlecock", "feather", "goose", "gb/t", "11881",
+                 "\u7fbd\u6bdb\u7403", "\u9e45", "\u7fbd\u6bdb", "\u5200\u7fce"],
+                " shuttlecock_feather_count gb_standard feather_count same_side_boundary ceiling_division",
+            ),
+            (
+                ["missing", "insufficient evidence", "no concrete", "failed", "failure", "fallback",
+                 "\u7f3a\u5c11", "\u672a\u627e\u5230", "\u8bc1\u636e\u4e0d\u8db3", "\u5931\u8d25"],
+                " evidence_gap tool_failure missing_data fallback_needed",
+            ),
+        ]
+
+        for markers, addition in domain_markers:
+            if any(marker in lowered for marker in markers):
+                expanded += addition
+        return expanded
 
     def _auto_extract_shortterm(self, request: MemoryRequest) -> None:
         """

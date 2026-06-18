@@ -203,3 +203,69 @@ The most important next code direction is therefore:
 - Add a separate retrieval path for failure-pattern memories, with lower lexical dependence on the exact task wording and stronger matching on failure modes such as missing coordinates, repeated search dead ends, evidence insufficiency, and need for deterministic calculation.
 - Add a small deterministic geospatial harness/tool path for coordinate normalization and circumcenter/distance calculation. Memory can remind the agent to use the path, but the computation itself should not be done by repeated web search.
 - Track "missed memory opportunity" in the evaluator: when relevant memories exist in `memory_after` but held-out receives zero long-term memories, report that as a retrieval recall failure distinct from harmful injection.
+
+## Task-Relevance Priority Sorting Isolation Pass
+
+This pass isolates one narrow change from the follow-up ideas above: replace the old global memory priority ordering with a task-relevance-first ordering before the LLM selector sees long-term memory candidates.
+
+Old behavior:
+
+- Candidate ordering was based on `_memory_priority_score(candidate)` only.
+- That score is global: it rewards prior success/helpful feedback, confidence, source quality, and usage, while penalizing harmful, stale, unsupported, and neutral feedback.
+- The query text was not part of this score, so a generally strong memory could outrank a more task-specific memory.
+
+New isolated behavior:
+
+- Each candidate now gets `task_relevance`, `priority_score`, and `rank_score`.
+- `rank_score = 2.0 * task_relevance + priority_score`.
+- `task_relevance` is a lightweight lexical/domain score over the current query, memory content, tags, failure type, `applies_when`, and `do_not_apply_when`.
+- Domain expansions were added for dialogue counting, geospatial/circumcenter tasks, shuttlecock feather-count tasks, evidence gaps, and deterministic calculation.
+- The LLM memory-selection prompt now shows both `Relevance` and `Priority`, but the downstream selector is otherwise unchanged.
+
+Validation:
+
+- `python -m compileall EvolveLab\providers\lightweight_memory_provider.py`: passed.
+- `git diff --check -- Flash-Searcher-main/EvolveLab/providers/lightweight_memory_provider.py`: passed with only the existing CRLF warning.
+- A local smoke check showed the deterministic ranker prefers matched domains over generic memories: dialogue and geospatial candidates scored above a generic formatting memory.
+
+Runs:
+
+- `xbench_output/targeted_warmstart_relevance_dialogue_20260618_180848`
+- `xbench_output/targeted_warmstart_relevance_geo_20260618_181540`
+- `xbench_output/targeted_warmstart_relevance_shuttle_20260618_183349`
+
+Summary:
+
+| Suite | Original failed task | Train tasks | Held-out correct | Total tokens | API calls | Elapsed | Change vs previous targeted run |
+|---|---:|---:|---:|---:|---:|---:|---|
+| `classical_dialogue_task3` | 3 | 2 | 0/1 | 102,575 | 23 | 321.1s | Worse: previous held-out was correct, but also had no memory event |
+| `geospatial_task10` | 10 | 2 | 0/1 | 737,859 | 69 | 1,012.6s | Worse: previous held-out was correct but expensive |
+| `shuttlecock_task5` | 5 | 3 | 1/1 | 163,266 | 32 | 429.7s | Still correct, but cost and held-out feedback worsened |
+
+Held-out details:
+
+| Suite | Held-out score | Held-out answer | Held-out tokens | API calls | Memory events | Feedback |
+|---|---:|---|---:|---:|---:|---|
+| `classical_dialogue_task3` | 0 | `5` | 67,389 | 13 | 0 | none |
+| `geospatial_task10` | 0 | `2.6公里` | 347,654 | 25 | 1 | neutral 1 |
+| `shuttlecock_task5` | 1 | `12只` | 82,979 | 14 | 1 | neutral 1 |
+
+Detailed interpretation:
+
+- Task 3 did not improve. The held-out answer regressed from `4` to `5`, and there were still `0` held-out memory events. The learned dialogue memory was too conditional and over-specific, so sorting could not rescue retrieval or injection.
+- Task 10 got worse. The second training task failed, produced 3 failure-pattern memories, but the held-out BEGIN phase still selected `0` long-term memories. The held-out run then relied on search and short-term memory and answered `2.6公里` instead of `6～7km`.
+- Task 5 remained correct and did inject one long-term memory at BEGIN, so task relevance sorting can still work when query and memory share strong lexical/domain anchors such as `GB/T 11881-2006`, shuttlecock, feathers, and goose. But it is weaker than the previous positive run: held-out cost rose from 44,995 to 82,979 tokens, API calls rose from 9 to 14, and memory feedback changed from helpful to neutral.
+
+Conclusion:
+
+This isolated change is not enough to claim improvement. It improves the *candidate pre-ordering* conceptually, but it does not fix the two actual bottlenecks exposed by the error cases:
+
+- memory content quality: success trajectories can produce overly narrow shortcut memories instead of reusable procedural memories;
+- memory selection recall: even when relevant failure patterns exist, the downstream LLM selector can still choose zero long-term memories at BEGIN.
+
+The next modification should therefore not be another global priority tweak. It should target retrieval recall directly:
+
+- add a separate failure-pattern lane that can inject one compact warning when failure-mode similarity is high;
+- record a missed-memory-opportunity metric whenever relevant memories exist but held-out BEGIN receives zero long-term memories;
+- tighten extraction so failure and procedural memories include reusable `applies_when` / `do_not_apply_when` boundaries rather than conditional-answer shortcuts;
+- for geospatial tasks, add deterministic coordinate/circumcenter calculation support in the harness so memory can guide the method while code handles arithmetic.
