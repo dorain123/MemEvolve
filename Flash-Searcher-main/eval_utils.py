@@ -164,13 +164,25 @@ def generate_unified_report(
     if not results:
         logger.warning("No results to generate report")
         return {}
+
+    def is_correct_result(result: Dict[str, Any]) -> bool:
+        judgement = result.get("judgement")
+        if isinstance(judgement, str):
+            return judgement.strip().lower() == "correct"
+        return result.get("score") == 1
+
+    def is_incorrect_result(result: Dict[str, Any]) -> bool:
+        judgement = result.get("judgement")
+        if isinstance(judgement, str):
+            return judgement.strip().lower() == "incorrect"
+        return result.get("score") == 0
     
     total = len(results)
     successful = sum(1 for r in results if r.get("status") == "success")
     errors = sum(1 for r in results if r.get("status") == "error")
     
-    correct = sum(1 for r in results if r.get("judgement", "").strip().lower() == "correct")
-    incorrect = sum(1 for r in results if r.get("judgement", "").strip().lower() == "incorrect")
+    correct = sum(1 for r in results if is_correct_result(r))
+    incorrect = sum(1 for r in results if is_incorrect_result(r))
     
     # Aggregate token usage and timing
     total_tokens = 0
@@ -193,7 +205,7 @@ def generate_unified_report(
         for r in results:
             level = r.get(level_key, "unknown")
             by_level[level]["total"] += 1
-            if r.get("judgement", "").strip().lower() == "correct":
+            if is_correct_result(r):
                 by_level[level]["correct"] += 1
     
     # Generate report
