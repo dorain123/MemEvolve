@@ -159,3 +159,47 @@ This is a positive mechanism result, not a broad benchmark result. The training 
 - the optimized budget gates reduced short-term injection noise during execution.
 
 The main caution is that the total suite still spent 155,635 tokens because three training tasks were needed before the held-out task. For a full claim, the next step is still a larger train/test evaluation where training cost is amortized across many held-out tasks.
+
+## Additional Targeted Error Cases
+
+After the shuttlecock case, two more previously failed tasks from the 1-10 run were probed with targeted warm-start suites.
+
+Runs:
+
+- `xbench_output/targeted_warmstart_dialogue_20260618_173720`
+- `xbench_output/targeted_warmstart_geo_20260618_174103`
+
+Summary:
+
+| Suite | Original failed task | Train tasks | Held-out correct | Total tokens | API calls | Elapsed |
+|---|---:|---:|---:|---:|---:|---:|
+| `classical_dialogue_task3` | 3 | 2 | 1/1 | 62,435 | 15 | 174.9s |
+| `geospatial_task10` | 10 | 2 | 1/1 | 414,214 | 43 | 733.2s |
+
+Held-out details:
+
+| Suite | Held-out score | Held-out answer | Held-out tokens | API calls | Memory events | Feedback |
+|---|---:|---|---:|---:|---:|---|
+| `classical_dialogue_task3` | 1 | `4` | 43,765 | 8 | 0 | none |
+| `geospatial_task10` | 1 | `6.88 km` | 261,848 | 22 | 1 | neutral 1 |
+
+Interpretation:
+
+- Task 3 is a useful boundary case, but not a proven memory win. Two training tasks learned dialogue-counting behavior, and the held-out answer became correct, but the held-out run had `memory_events=0`. The likely cause is over-conservative or poorly bridged retrieval: abstract Liaozhai dialogue-counting memories did not match the concrete `Green-clothed Woman` question at BEGIN time.
+- Task 10 is also correct on held-out, but it is not an efficient memory win. It used 261,848 held-out tokens and 22 API calls. The run succeeded mostly through web search, coordinate collection, and late short-term context rather than long-term warm-start retrieval.
+- The geospatial suite exposed the new harmful-memory path: `geo_train_2` failed, used 1 injected memory, and that memory was labeled harmful. The failure trajectory then produced 3 failure-pattern memories. This confirms that harmful feedback and failure-pattern extraction are active beyond the earlier normal 1-10 run.
+- However, those failure-pattern memories were not injected into the held-out Task 10 BEGIN phase. The memory database before held-out contained 6 strategic, 3 operational, and 3 failure-pattern memories, but the selected memory ID count was 0. This suggests the next improvement should target failure-pattern retrieval recall, not only failure-pattern storage.
+
+Updated conclusion:
+
+The targeted runs now show three different outcomes:
+
+- Task 5: true positive warm-start mechanism. A relevant long-term memory was injected at BEGIN, labeled helpful, and the previously failed held-out task became correct.
+- Task 3: answer improved, but no memory was injected. This should be treated as model/search variance or normal tool success, not as memory evidence.
+- Task 10: answer improved, but with high token cost and only neutral short-term memory on held-out. The run is more evidence for harness/tooling needs than for long-term memory quality.
+
+The most important next code direction is therefore:
+
+- Add a separate retrieval path for failure-pattern memories, with lower lexical dependence on the exact task wording and stronger matching on failure modes such as missing coordinates, repeated search dead ends, evidence insufficiency, and need for deterministic calculation.
+- Add a small deterministic geospatial harness/tool path for coordinate normalization and circumcenter/distance calculation. Memory can remind the agent to use the path, but the computation itself should not be done by repeated web search.
+- Track "missed memory opportunity" in the evaluator: when relevant memories exist in `memory_after` but held-out receives zero long-term memories, report that as a retrieval recall failure distinct from harmful injection.
